@@ -183,6 +183,12 @@ EOF
 chmod 600 /etc/rancher/k3s/k3s.env
 
 # 服务文件：--server 模式加入已有 HA 集群（不带 --cluster-init）
+#
+# 重要：K3s "critical config"（egress-selector-mode、cluster-cidr、service-cidr、
+# cluster-dns 等）在集群初始化时已写入 etcd，加入节点不得重复指定这些参数。
+# 若加入节点指定了这些参数，K3s 会将其与 etcd 存储值比对，任何不匹配即报错退出。
+# 加入节点只需指定节点级参数（server、advertise-address、node-name、tls-san）
+# 以及 bind-address 等非 critical 的运行时参数。
 cat > /etc/systemd/system/k3s.service << EOF
 [Unit]
 Description=Lightweight Kubernetes
@@ -196,8 +202,15 @@ EnvironmentFile=-/etc/rancher/k3s/k3s.env
 ExecStart=/usr/local/bin/k3s server \\
   --server=https://${FIRST_SERVER_ADDR}:${FIRST_SERVER_PORT} \\
   --advertise-address=${NODE_IP} \\
+  --node-name=${NODE_NAME} \\
   --tls-san=${NODE_IP} \\
-  --egress-selector-mode=disabled
+  --bind-address=0.0.0.0 \\
+  --kube-apiserver-arg=bind-address=0.0.0.0 \\
+  --kube-apiserver-arg=advertise-address=${NODE_IP} \\
+  --kube-apiserver-arg=kubelet-certificate-authority= \\
+  --kube-controller-manager-arg=bind-address=0.0.0.0 \\
+  --kube-controller-manager-arg=node-cidr-mask-size=24 \\
+  --kube-scheduler-arg=bind-address=0.0.0.0
 KillMode=process
 Delegate=yes
 LimitNOFILE=1048576
@@ -242,6 +255,8 @@ for i in $(seq 1 60); do
     echo "  1. 确认第一个控制节点使用了 --cluster-init（内置 etcd 模式）" | tee -a "$INSTALL_LOG"
     echo "  2. 确认 token 正确（来自 cat /var/lib/rancher/k3s/server/token）" | tee -a "$INSTALL_LOG"
     echo "  3. 确认端口 6443/2379/2380 互通" | tee -a "$INSTALL_LOG"
+    echo "  4. 若报 'critical configuration mismatched'，说明此节点参数与集群不符" | tee -a "$INSTALL_LOG"
+    echo "     查看详细日志: journalctl -u k3s -n 50 --no-pager" | tee -a "$INSTALL_LOG"
     exit 1
   fi
   if [ $((i % 10)) -eq 0 ]; then
