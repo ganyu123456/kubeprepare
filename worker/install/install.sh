@@ -94,10 +94,21 @@ cp "$K3S_BIN" /usr/local/bin/k3s
 chmod +x /usr/local/bin/k3s
 echo "✓ k3s 二进制文件已安装: $(k3s --version 2>/dev/null | head -1)" | tee -a "$INSTALL_LOG"
 
-# 步骤2: 创建 k3s-agent systemd 服务
+# 步骤2: 创建 k3s-agent systemd 服务（参照官方 k3s install 脚本方式）
 echo "[2/3] 配置 k3s-agent systemd 服务..." | tee -a "$INSTALL_LOG"
 
-cat > /etc/systemd/system/k3s-agent.service << EOF
+# 用环境文件传参，与官方 k3s 在线安装方式保持一致
+# 注意：node-role.kubernetes.io/* 是受保护前缀，不能通过 --node-label 由节点自己设置
+#       加入后由 master 执行 kubectl label node 来打 worker 角色标签
+mkdir -p /etc/rancher/k3s
+cat > /etc/rancher/k3s/k3s.env << EOF
+K3S_URL=https://${K3S_MASTER_ADDR}:${K3S_MASTER_PORT}
+K3S_TOKEN=${K3S_TOKEN}
+K3S_NODE_NAME=${NODE_NAME}
+EOF
+chmod 600 /etc/rancher/k3s/k3s.env
+
+cat > /etc/systemd/system/k3s-agent.service << 'SVCEOF'
 [Unit]
 Description=Lightweight Kubernetes Agent
 Documentation=https://k3s.io
@@ -106,11 +117,8 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/k3s agent \\
-  --server=https://${K3S_MASTER_ADDR}:${K3S_MASTER_PORT} \\
-  --token=${K3S_TOKEN} \\
-  --node-name=${NODE_NAME} \\
-  --node-label=node-role.kubernetes.io/worker=true
+EnvironmentFile=-/etc/rancher/k3s/k3s.env
+ExecStart=/usr/local/bin/k3s agent
 KillMode=process
 Delegate=yes
 LimitNOFILE=1048576
@@ -126,21 +134,18 @@ SyslogIdentifier=k3s-agent
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SVCEOF
 
 chmod 644 /etc/systemd/system/k3s-agent.service
 systemctl daemon-reload
 systemctl enable k3s-agent
 echo "✓ k3s-agent 服务配置完成" | tee -a "$INSTALL_LOG"
 
-# 步骤3: 启动服务并等待就绪
+# 步骤3: 非阻塞启动，等待进程存活
 echo "[3/3] 启动 k3s-agent 服务..." | tee -a "$INSTALL_LOG"
 
-if ! systemctl start k3s-agent; then
-  echo "❌ 启动 k3s-agent 失败，查看日志:" | tee -a "$INSTALL_LOG"
-  systemctl status k3s-agent --no-pager | tee -a "$INSTALL_LOG"
-  exit 1
-fi
+# --no-block 立即返回，避免 Type=notify+TimeoutStartSec=0 导致永久阻塞
+systemctl start --no-block k3s-agent
 
 echo "等待 k3s-agent 启动（最多 60 秒）..." | tee -a "$INSTALL_LOG"
 for i in $(seq 1 30); do
@@ -178,6 +183,9 @@ echo "2. 查看 k3s-agent 实时日志:" | tee -a "$INSTALL_LOG"
 echo "   journalctl -u k3s-agent -f" | tee -a "$INSTALL_LOG"
 echo "3. 在 master 节点验证 worker 已加入:" | tee -a "$INSTALL_LOG"
 echo "   kubectl get nodes" | tee -a "$INSTALL_LOG"
+echo "4. 在 master 节点为该节点打上 worker 角色标签:" | tee -a "$INSTALL_LOG"
+echo "   kubectl label node ${NODE_NAME} node-role.kubernetes.io/worker=''" | tee -a "$INSTALL_LOG"
+echo "   （node-role.kubernetes.io/* 是受保护前缀，只能由 master 设置）" | tee -a "$INSTALL_LOG"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a "$INSTALL_LOG"
 echo "" | tee -a "$INSTALL_LOG"
 echo "安装日志: $INSTALL_LOG" | tee -a "$INSTALL_LOG"
