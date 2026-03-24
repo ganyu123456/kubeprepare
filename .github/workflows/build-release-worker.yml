@@ -1,0 +1,165 @@
+name: 构建和发布 K3s Worker 节点离线包
+
+on:
+  push:
+    tags:
+      - 'v*'
+    paths:
+      - 'worker/**'
+      - '.github/workflows/build-release-worker.yml'
+  workflow_dispatch:
+    # 手动触发时默认使用提交短 hash 作为发布标识
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-worker:
+    runs-on: ubuntu-latest
+    name: 构建并发布 K3s Worker 离线包 (${{ matrix.arch }})
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            dockerfile_platform: linux/amd64
+          - arch: arm64
+            dockerfile_platform: linux/arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置环境变量
+        id: set_env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_VERSION="manual-worker-${GITHUB_SHA::7}"
+          else
+            TAG_VERSION=${GITHUB_REF#refs/tags/}
+            if [ -z "$TAG_VERSION" ]; then
+              echo "error: 未能解析到 tag，请使用 tag 触发或手动触发" >&2
+              exit 1
+            fi
+          fi
+          echo "TAG_VERSION=${TAG_VERSION}" >> $GITHUB_ENV
+          echo "tag_version=${TAG_VERSION}" >> $GITHUB_OUTPUT
+          echo "ARCH=${{ matrix.arch }}" >> $GITHUB_ENV
+
+          # 版本号（与云端保持一致）
+          echo "K3S_VERSION=v1.34.2+k3s1" >> $GITHUB_ENV
+
+      - name: 构建 K3s Worker 离线包
+        run: |
+          set -euo pipefail
+
+          echo "=== 构建 K3s Worker 离线包 (架构: ${{ matrix.arch }}) ==="
+          echo "版本信息: K3s ${K3S_VERSION}"
+
+          # 1. 下载 k3s 二进制文件
+          echo "[1/3] 下载 k3s 二进制文件..."
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            K3S_DOWNLOAD_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s"
+          else
+            K3S_DOWNLOAD_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s-arm64"
+          fi
+          wget -q --show-progress -O "k3s-${{ matrix.arch }}" "$K3S_DOWNLOAD_URL" \
+            || (echo "❌ 错误：无法下载 k3s ${{ matrix.arch }}" && exit 1)
+          chmod +x "k3s-${{ matrix.arch }}"
+          echo "✓ k3s 下载完成"
+
+          # 2. 准备安装脚本
+          echo "[2/3] 准备安装脚本..."
+          INSTALL_SCRIPT="${GITHUB_WORKSPACE}/worker/install/install.sh"
+          CLEANUP_SCRIPT="${GITHUB_WORKSPACE}/worker/install/cleanup.sh"
+
+          if [ ! -f "$INSTALL_SCRIPT" ]; then
+            echo "❌ 错误：找不到安装脚本 $INSTALL_SCRIPT"
+            ls -la "${GITHUB_WORKSPACE}/worker/install/" || echo "worker/install 目录不存在"
+            exit 1
+          fi
+          echo "✓ 安装脚本就绪: $INSTALL_SCRIPT"
+
+          # 3. 创建安装元数据
+          echo "[3/3] 创建安装元数据和打包..."
+          mkdir -p meta
+          cat > meta/version.txt << EOFMETA
+          k3s_version=${K3S_VERSION}
+          arch=${{ matrix.arch }}
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          tag=${TAG_VERSION}
+          EOFMETA
+          echo "✓ 安装元数据已创建"
+
+          # 打包离线安装包
+          PACKAGE_NAME="k3s-worker-${K3S_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
+
+          TEMP_PKG_DIR="$(mktemp -d)"
+          trap "rm -rf $TEMP_PKG_DIR" EXIT
+
+          # 复制文件到临时目录
+          cp "k3s-${{ matrix.arch }}" "$TEMP_PKG_DIR/"
+          cp -r meta "$TEMP_PKG_DIR/"
+          cp "$INSTALL_SCRIPT" "$TEMP_PKG_DIR/"
+          if [ -f "$CLEANUP_SCRIPT" ]; then
+            cp "$CLEANUP_SCRIPT" "$TEMP_PKG_DIR/"
+            echo "✓ 已包含 cleanup.sh 清理脚本"
+          fi
+
+          # 生成包内说明文件
+          cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
+K3s Worker 节点离线安装包
+========================
+
+版本信息:
+  K3s: ${K3S_VERSION}
+  架构: ${{ matrix.arch }}
+  构建时间: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+使用方法:
+  sudo ./install.sh <master-ip:port> <k3s-token> [node-name]
+
+示例:
+  sudo ./install.sh 192.168.122.231:6443 K10xxx...::xxx:sh worker-01
+
+参数说明:
+  master-ip:port  K3s master 节点地址和端口（端口默认 6443）
+  k3s-token       K3s 加入令牌（在 master 节点执行：cat /var/lib/rancher/k3s/server/node-token）
+  node-name       Worker 节点名称（可选，默认 k3s-worker-<hostname>）
+
+清理/重装:
+  sudo ./cleanup.sh
+
+验证:
+  在 master 节点执行: kubectl get nodes
+
+详细文档: https://github.com/k3s-io/k3s
+EOFREADME
+
+          # 打包
+          tar -czf "$PACKAGE_NAME" -C "$TEMP_PKG_DIR" .
+          echo "✓ 包已创建: $PACKAGE_NAME"
+          echo "包大小: $(du -h "$PACKAGE_NAME" | cut -f1)"
+
+      - name: 生成校验和并准备发布文件
+        run: |
+          PACKAGE_NAME="k3s-worker-${K3S_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
+          sha256sum "$PACKAGE_NAME" > "${PACKAGE_NAME}.sha256sum.txt"
+
+          mkdir -p "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}"
+          cp "$PACKAGE_NAME" "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+          cp "${PACKAGE_NAME}.sha256sum.txt" "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+
+          echo "=== 准备发布的文件 (${{ matrix.arch }}) ==="
+          ls -lh "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+
+      - name: 上传到 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set_env.outputs.tag_version }}
+          files: release-${{ matrix.arch }}/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

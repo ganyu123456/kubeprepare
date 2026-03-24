@@ -3,7 +3,8 @@
 ## 简介
 
 这是一个完整的 KubeEdge 1.22 离线安装解决方案，包括：
-- **云端**：K3s + KubeEdge CloudCore + EdgeMesh + Metrics Server（支持 amd64/arm64）
+- **云端（Master）**：K3s + KubeEdge CloudCore + EdgeMesh + Metrics Server（支持 amd64/arm64）
+- **K3s Worker 节点**：纯 k3s agent，扩展云端 Kubernetes 集群算力（支持 amd64/arm64）
 - **边缘端**：containerd + runc + KubeEdge EdgeCore（支持 amd64/arm64）
 - **日志与监控**：kubectl logs/exec + kubectl top（完全离线支持）
 
@@ -48,6 +49,10 @@
 - `kubeedge-cloud-1.22.0-k3s-v1.34.2+k3s1-amd64.tar.gz`
 - `kubeedge-cloud-1.22.0-k3s-v1.34.2+k3s1-arm64.tar.gz`
 
+**K3s Worker 包命名格式**:
+- `k3s-worker-v1.34.2+k3s1-amd64.tar.gz`
+- `k3s-worker-v1.34.2+k3s1-arm64.tar.gz`
+
 **边缘端包命名格式**:
 - `kubeedge-edge-1.22.0-amd64.tar.gz`
 - `kubeedge-edge-1.22.0-arm64.tar.gz`
@@ -71,7 +76,29 @@ sudo ./install/install.sh 192.168.1.100 my-master
 
 安装完成后将自动输出边缘节点的接入 token，保存在 `/etc/kubeedge/token.txt`。
 
-### 3. 边缘端安装（一键部署）
+### 3. K3s Worker 节点安装（一键部署）
+
+```bash
+# 解压离线包
+tar -xzf k3s-worker-v1.34.2+k3s1-amd64.tar.gz
+cd k3s-worker-v1.34.2+k3s1-amd64
+
+# 安装（需要 sudo）
+# 参数1: master 地址（格式：IP:PORT，端口通常为 6443）
+# 参数2: k3s token（master 节点执行 cat /var/lib/rancher/k3s/server/node-token 获取）
+# 参数3: worker 节点名称（可选，默认 k3s-worker-<hostname>）
+sudo ./install.sh 192.168.122.231:6443 K10xxx...::xxx:sh worker-01
+```
+
+在 master 节点验证 worker 已加入：
+```bash
+kubectl get nodes
+```
+
+> **注意**：K3s Worker 节点是纯 Kubernetes 计算节点，用于扩展云端算力。
+> 若需部署 KubeEdge **边缘节点**（EdgeCore），请使用边缘端安装包。
+
+### 4. 边缘端安装（一键部署）
 
 ```bash
 # 解压离线包
@@ -95,22 +122,27 @@ kubectl get nodes
 ```
 kubeprepare/
 ├── .github/
-│   └── workflows/                  # GitHub Actions 自动化构建流程
-│       ├── build-release-cloud.yml # 云端离线包自动构建和发布
-│       └── build-release-edge.yml  # 边缘端离线包自动构建和发布
-├── cloud/                          # 云端相关
+│   └── workflows/                   # GitHub Actions 自动化构建流程
+│       ├── build-release-cloud.yml  # 云端离线包自动构建和发布
+│       ├── build-release-worker.yml # K3s Worker 节点离线包自动构建和发布
+│       └── build-release-edge.yml   # 边缘端离线包自动构建和发布
+├── cloud/                           # 云端相关（K3s Master + CloudCore）
 │   ├── install/
-│   │   ├── install.sh              # 云端安装脚本
-│   │   └── README.md               # 云端详细说明
-│   ├── release/                    # 离线包临时构建目录（由 Actions 生成）
-│   └── systemd/                    # 系统服务配置文件
-├── edge/                           # 边缘端相关
+│   │   ├── install.sh               # 云端安装脚本
+│   │   └── README.md                # 云端详细说明
+│   ├── release/                     # 离线包临时构建目录（由 Actions 生成）
+│   └── systemd/                     # 系统服务配置文件
+├── worker/                          # K3s Worker 节点相关
+│   └── install/
+│       ├── install.sh               # Worker 节点安装脚本
+│       └── cleanup.sh               # Worker 节点清理脚本
+├── edge/                            # 边缘端相关（KubeEdge EdgeCore）
 │   ├── install/
-│   │   ├── install.sh              # 边缘端安装脚本
-│   │   └── README.md               # 边缘端详细说明
-│   ├── release/                    # 离线包临时构建目录（由 Actions 生成）
-│   └── systemd/                    # 系统服务配置文件
-│       └── mosquitto.service       # MQTT Broker 服务配置
+│   │   ├── install.sh               # 边缘端安装脚本
+│   │   └── README.md                # 边缘端详细说明
+│   ├── release/                     # 离线包临时构建目录（由 Actions 生成）
+│   └── systemd/                     # 系统服务配置文件
+│       └── mosquitto.service        # MQTT Broker 服务配置
 ├── docs/                           # 项目文档目录
 │   ├── EDGEMESH_DEPLOYMENT.md      # EdgeMesh 完整部署方案（含官方最佳实践）
 │   ├── EDGECORE_CONFIG_BEST_PRACTICES.md # EdgeCore 配置最佳实践
@@ -160,8 +192,9 @@ kubeprepare/
 
 ✅ **多架构支持** - amd64 和 arm64 兼容
 
-✅ **一键安装** - 云端和边缘端都支持自动化部署
+✅ **一键安装** - 云端、Worker 和边缘端均支持自动化部署
   - 云端：`sudo ./install/install.sh <IP> [节点名]`
+  - Worker：`sudo ./install.sh <master-ip:port> <k3s-token> [节点名]`
   - 边缘：`sudo ./install/install.sh <云端地址> <token> <节点名>`
 
 ✅ **镜像预导入** - 安装前自动加载所有镜像，避免在线拉取
@@ -169,7 +202,7 @@ kubeprepare/
 ✅ **Token 安全机制** - 云端自动生成 token 供边缘端接入
 
 ✅ **持续集成** - GitHub Actions 自动构建和发布到 Release
-  - 自动构建多架构离线包
+  - 自动构建多架构离线包（云端 / Worker / 边缘端 三类独立包）
   - 自动下载和打包所有依赖
   - 自动发布到 GitHub Releases
 
@@ -179,6 +212,18 @@ kubeprepare/
 ✅ **IoT 友好** - 支持 MQTT Broker 部署
   - Mosquitto 服务配置文件
   - 完整的 MQTT 集成指南
+
+## 节点角色说明
+
+| 节点类型 | 安装包 | 角色说明 |
+|----------|--------|---------|
+| **云端 Master** | `kubeedge-cloud-*.tar.gz` | K3s 主节点 + KubeEdge CloudCore，集群控制面 |
+| **K3s Worker** | `k3s-worker-*.tar.gz` | K3s Agent，扩展云端计算算力，与 master 在同一 k8s 集群 |
+| **KubeEdge 边缘** | `kubeedge-edge-*.tar.gz` | EdgeCore，通过 KubeEdge 接入，适用于网络条件差的边缘场景 |
+
+> **Worker vs 边缘节点区别：**
+> - **K3s Worker**：稳定内网连接，常规 Kubernetes 节点，参与 k8s 调度，支持所有 k8s 功能
+> - **KubeEdge 边缘**：弱网/离线场景，通过 WebSocket 长连接接入，专为 IoT/工业边缘设计
 
 ## 网络架构
 
@@ -245,14 +290,22 @@ bash verify_cloud_images.sh kubeedge-cloud-1.22.0-k3s-v1.34.2+k3s1-amd64.tar.gz
 
 ### 清理重新安装
 
+**云端 / 边缘节点：**
 ```bash
 sudo bash cleanup.sh
 ```
 
-此脚本将清理：
-- edgecore 和 containerd 服务
-- 相关二进制文件
-- 配置文件和数据目录
+**K3s Worker 节点：**
+```bash
+sudo ./cleanup.sh
+# 清理后如需从 k8s 集群中删除节点记录，在 master 执行：
+kubectl delete node <node-name>
+```
+
+清理内容：
+- 停止并卸载相关服务（k3s-agent / edgecore）
+- 删除二进制文件
+- 清理配置文件和数据目录
 
 ### 日志采集与资源监控验证
 
@@ -312,7 +365,7 @@ helm install edgemesh ./helm-charts/edgemesh.tgz \
 ## 版本信息
 
 - **KubeEdge**: v1.22.0
-- **K3s**: v1.34.2+k3s1
+- **K3s**: v1.34.2+k3s1（云端 Master 和 K3s Worker 共用）
 - **EdgeMesh**: v1.17.0
 - **Metrics Server**: v0.8.0 (与 K3s 内置版本对齐)
 - **Istio CRDs**: v1.22.0 (destinationrule, gateway, virtualservice)
