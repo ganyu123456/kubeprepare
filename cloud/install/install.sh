@@ -565,6 +565,7 @@ Wants=network-online.target
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/k3s server \\
+  --cluster-init \\
   --egress-selector-mode=disabled \\
   --advertise-address=$EXTERNAL_IP \\
   --node-name=$NODE_NAME \\
