@@ -128,6 +128,10 @@ jobs:
             k3s-token       K3s 加入令牌（在 master 节点执行：cat /var/lib/rancher/k3s/server/node-token）
             node-name       Worker 节点名称（可选，默认 k3s-worker-<hostname>）
 
+          说明:
+            安装脚本会自动为节点打上 node-role.kubernetes.io/worker=true 标签，
+            kubectl get nodes 的 ROLES 列将显示 worker。
+
           清理/重装:
             sudo ./cleanup.sh
 

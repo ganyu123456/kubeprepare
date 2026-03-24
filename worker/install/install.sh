@@ -109,7 +109,8 @@ Type=notify
 ExecStart=/usr/local/bin/k3s agent \\
   --server=https://${K3S_MASTER_ADDR}:${K3S_MASTER_PORT} \\
   --token=${K3S_TOKEN} \\
-  --node-name=${NODE_NAME}
+  --node-name=${NODE_NAME} \\
+  --node-label=node-role.kubernetes.io/worker=true
 KillMode=process
 Delegate=yes
 LimitNOFILE=1048576
