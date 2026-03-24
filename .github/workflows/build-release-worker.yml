@@ -109,33 +109,33 @@ jobs:
 
           # 生成包内说明文件
           cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
-K3s Worker 节点离线安装包
-========================
+          K3s Worker 节点离线安装包
+          ========================
 
-版本信息:
-  K3s: ${K3S_VERSION}
-  架构: ${{ matrix.arch }}
-  构建时间: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          版本信息:
+            K3s: ${K3S_VERSION}
+            架构: ${{ matrix.arch }}
+            构建时间: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-使用方法:
-  sudo ./install.sh <master-ip:port> <k3s-token> [node-name]
+          使用方法:
+            sudo ./install.sh <master-ip:port> <k3s-token> [node-name]
 
-示例:
-  sudo ./install.sh 192.168.122.231:6443 K10xxx...::xxx:sh worker-01
+          示例:
+            sudo ./install.sh 192.168.122.231:6443 K10xxx...::xxx:sh worker-01
 
-参数说明:
-  master-ip:port  K3s master 节点地址和端口（端口默认 6443）
-  k3s-token       K3s 加入令牌（在 master 节点执行：cat /var/lib/rancher/k3s/server/node-token）
-  node-name       Worker 节点名称（可选，默认 k3s-worker-<hostname>）
+          参数说明:
+            master-ip:port  K3s master 节点地址和端口（端口默认 6443）
+            k3s-token       K3s 加入令牌（在 master 节点执行：cat /var/lib/rancher/k3s/server/node-token）
+            node-name       Worker 节点名称（可选，默认 k3s-worker-<hostname>）
 
-清理/重装:
-  sudo ./cleanup.sh
+          清理/重装:
+            sudo ./cleanup.sh
 
-验证:
-  在 master 节点执行: kubectl get nodes
+          验证:
+            在 master 节点执行: kubectl get nodes
 
-详细文档: https://github.com/k3s-io/k3s
-EOFREADME
+          详细文档: https://github.com/k3s-io/k3s
+          EOFREADME
 
           # 打包
           tar -czf "$PACKAGE_NAME" -C "$TEMP_PKG_DIR" .
