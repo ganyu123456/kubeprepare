@@ -153,6 +153,21 @@ jobs:
           chmod +x ./helm
           rm -rf linux-${{ matrix.arch }} helm.tar.gz
           echo "✓ Helm 二进制文件下载完成 (${HELM_VERSION})"
+
+          # 4.7. 下载 nfs-common 离线 deb 包（在干净 Ubuntu 容器内获取全部依赖）
+          echo "[4.7/6] 下载 nfs-common 离线 deb 包（${{ matrix.arch }}）..."
+          mkdir -p nfs
+          docker run --rm \
+            --platform ${{ matrix.dockerfile_platform }} \
+            -v "$(pwd)/nfs:/debs" \
+            ubuntu:22.04 bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --download-only --no-install-recommends nfs-common 2>/dev/null || true
+              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
+            "
+          echo "✓ nfs-common 离线包已下载: $(ls nfs/*.deb 2>/dev/null | wc -l) 个 deb"
+          ls -lh nfs/
           
           # 5. 下载 EdgeMesh Helm Chart
           echo "[4.5/6] 下载 EdgeMesh Helm Chart..."
@@ -204,6 +219,12 @@ jobs:
           if [ -f helm ]; then
             cp helm "$TEMP_PKG_DIR/"
             echo "✓ 已包含 Helm 二进制文件"
+          fi
+
+          # 复制 nfs-common 离线 deb 包
+          if [ -d nfs ] && ls nfs/*.deb &>/dev/null 2>&1; then
+            cp -r nfs "$TEMP_PKG_DIR/"
+            echo "✓ 已包含 nfs-common 离线包 ($(ls nfs/*.deb | wc -l) 个 deb)"
           fi
           
           # 复制 EdgeMesh Helm charts (如果存在)

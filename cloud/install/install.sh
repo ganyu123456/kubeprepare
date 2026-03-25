@@ -469,9 +469,59 @@ EOF
   return 0
 }
 
+# ─────────────────────────────────────
+# 函数: 安装 nfs-common（离线优先，在线回退）
+# ─────────────────────────────────────
+install_nfs_common() {
+  if dpkg -l nfs-common 2>/dev/null | grep -q "^ii" || command -v mount.nfs4 &>/dev/null; then
+    echo "✓ nfs-common 已安装" | tee -a "$INSTALL_LOG"
+    return 0
+  fi
+  echo "[系统依赖] 安装 nfs-common（NFS 客户端，K8s NFS PVC 挂载必需）..." | tee -a "$INSTALL_LOG"
+  NFS_DIR=$(find "$SCRIPT_DIR" -maxdepth 2 -type d -name "nfs" 2>/dev/null | head -1)
+  if [ -n "$NFS_DIR" ] && ls "$NFS_DIR"/*.deb &>/dev/null 2>&1; then
+    echo "  使用离线 deb 包安装..." | tee -a "$INSTALL_LOG"
+    dpkg -i --force-depends "$NFS_DIR"/*.deb >> "$INSTALL_LOG" 2>&1 || true
+    apt-get install -f -y -qq >> "$INSTALL_LOG" 2>&1 || true
+  fi
+  if dpkg -l nfs-common 2>/dev/null | grep -q "^ii"; then
+    echo "✓ nfs-common 离线安装成功" | tee -a "$INSTALL_LOG"
+    return 0
+  fi
+  echo "  在线安装 nfs-common..." | tee -a "$INSTALL_LOG"
+  apt-get update -qq >> "$INSTALL_LOG" 2>&1 && \
+    apt-get install -y -qq nfs-common >> "$INSTALL_LOG" 2>&1 && \
+    echo "✓ nfs-common 在线安装成功" | tee -a "$INSTALL_LOG" || \
+    echo "⚠️  nfs-common 安装失败，NFS PVC 挂载可能受影响" | tee -a "$INSTALL_LOG"
+}
+
+# ─────────────────────────────────────
+# 函数: 安装 helm 到系统 PATH
+# ─────────────────────────────────────
+install_helm_to_path() {
+  if command -v helm &>/dev/null; then
+    echo "✓ helm 已在 PATH: $(helm version --short 2>/dev/null)" | tee -a "$INSTALL_LOG"
+    return 0
+  fi
+  HELM_BIN=$(find "$SCRIPT_DIR" -maxdepth 2 -name "helm" -type f 2>/dev/null | head -1)
+  if [ -z "$HELM_BIN" ]; then
+    echo "⚠️  未在离线包中找到 helm 二进制文件，跳过安装" | tee -a "$INSTALL_LOG"
+    return 0
+  fi
+  echo "[系统依赖] 安装 helm 到 /usr/local/bin/..." | tee -a "$INSTALL_LOG"
+  cp "$HELM_BIN" /usr/local/bin/helm
+  chmod +x /usr/local/bin/helm
+  echo "✓ helm 安装成功: $(helm version --short 2>/dev/null)" | tee -a "$INSTALL_LOG"
+}
+
 # =====================================
 # 主程序逻辑
 # =====================================
+
+# 安装系统依赖（两种模式都需要）
+echo "[系统依赖] 安装 nfs-common 和 helm..." | tee -a "$INSTALL_LOG"
+install_nfs_common
+install_helm_to_path
 
 # worker模式只做worker节点安装
 if [ "$MODE" = "worker" ]; then

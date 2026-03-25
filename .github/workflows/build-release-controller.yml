@@ -57,6 +57,8 @@ jobs:
 
           # 版本号（与云端保持一致）
           echo "K3S_VERSION=v1.34.2+k3s1" >> $GITHUB_ENV
+          echo "HELM_VERSION=v3.19.2"      >> $GITHUB_ENV
+          echo "EDGEMESH_VERSION=v1.17.0"  >> $GITHUB_ENV
 
       - name: 构建 K3s 控制节点离线包
         run: |
@@ -104,6 +106,36 @@ jobs:
           done
           echo "✓ K3s 系统镜像处理完成"
 
+          # 3. 下载 Helm + Helm Charts + nfs-common 离线包
+          echo "[2.5/3] 下载 Helm 二进制文件..."
+          HELM_TAR="helm-${HELM_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          wget -q -O helm.tar.gz "https://get.helm.sh/${HELM_TAR}" \
+            || (echo "❌ 错误：无法下载 Helm" && exit 1)
+          tar -xzf helm.tar.gz
+          mv linux-${{ matrix.arch }}/helm ./helm
+          chmod +x ./helm
+          rm -rf linux-${{ matrix.arch }} helm.tar.gz
+          echo "✓ Helm 下载完成 (${HELM_VERSION})"
+
+          echo "[2.6/3] 下载 EdgeMesh Helm Chart..."
+          mkdir -p helm-charts
+          wget -q -O helm-charts/edgemesh.tgz \
+            "https://raw.githubusercontent.com/kubeedge/edgemesh/main/build/helm/edgemesh.tgz" \
+            || echo "⚠️  EdgeMesh chart 下载失败，跳过"
+
+          echo "[2.7/3] 下载 nfs-common 离线 deb 包（${{ matrix.arch }}）..."
+          mkdir -p nfs
+          docker run --rm \
+            --platform ${{ matrix.dockerfile_platform }} \
+            -v "$(pwd)/nfs:/debs" \
+            ubuntu:22.04 bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --download-only --no-install-recommends nfs-common 2>/dev/null || true
+              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
+            "
+          echo "✓ nfs-common 离线包已下载: $(ls nfs/*.deb 2>/dev/null | wc -l) 个 deb"
+
           # 3. 准备脚本并打包
           echo "[3/3] 准备脚本并打包..."
           INSTALL_DIR="${GITHUB_WORKSPACE}/controller/install"
@@ -138,6 +170,24 @@ jobs:
           if [ -f "$CLEANUP_SCRIPT" ]; then
             cp "$CLEANUP_SCRIPT" "$TEMP_PKG_DIR/"
             echo "✓ 已包含 cleanup.sh 清理脚本"
+          fi
+
+          # 复制 Helm 二进制文件
+          if [ -f helm ]; then
+            cp helm "$TEMP_PKG_DIR/"
+            echo "✓ 已包含 Helm 二进制文件"
+          fi
+
+          # 复制 EdgeMesh Helm chart
+          if [ -d helm-charts ] && ls helm-charts/*.tgz &>/dev/null 2>&1; then
+            cp -r helm-charts "$TEMP_PKG_DIR/"
+            echo "✓ 已包含 Helm Charts"
+          fi
+
+          # 复制 nfs-common 离线包
+          if [ -d nfs ] && ls nfs/*.deb &>/dev/null 2>&1; then
+            cp -r nfs "$TEMP_PKG_DIR/"
+            echo "✓ 已包含 nfs-common 离线包 ($(ls nfs/*.deb | wc -l) 个 deb)"
           fi
 
           cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
