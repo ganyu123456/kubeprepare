@@ -112,15 +112,7 @@ jobs:
             "https://raw.githubusercontent.com/kubeedge/edgemesh/main/build/helm/edgemesh.tgz" \
             || echo "⚠️  EdgeMesh chart 下载失败，跳过"
 
-          # 下载 nfs-common 离线 deb 包
-          mkdir -p nfs
-          docker run --rm --platform ${{ matrix.dockerfile_platform }} -v "$(pwd)/nfs:/debs" \
-            ubuntu:22.04 bash -c "
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq && apt-get install -y --download-only --no-install-recommends nfs-common &>/dev/null || true
-              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
-            "
-          echo "✓ nfs-common 离线包已下载: $(ls nfs/*.deb 2>/dev/null | wc -l) 个 deb"
+
 
           # 4. 准备安装脚本和打包
           echo "[4/4] 准备安装脚本和打包..."
