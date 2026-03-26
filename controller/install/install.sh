@@ -236,11 +236,11 @@ chmod 600 /etc/rancher/k3s/k3s.env
 
 # 服务文件：--server 模式加入已有 HA 集群（不带 --cluster-init）
 #
-# 重要：K3s "critical config"（egress-selector-mode、cluster-cidr、service-cidr、
-# cluster-dns 等）在集群初始化时已写入 etcd，加入节点不得重复指定这些参数。
-# 若加入节点指定了这些参数，K3s 会将其与 etcd 存储值比对，任何不匹配即报错退出。
-# 加入节点只需指定节点级参数（server、advertise-address、node-name、tls-san）
-# 以及 bind-address 等非 critical 的运行时参数。
+# 重要（K3s v1.26+）：K3s "critical config"（egress-selector-mode、cluster-cidr、
+# service-cidr、cluster-dns 等）在集群初始化时写入 etcd，加入节点启动时 K3s 会将
+# 本地指定值（或默认值）与 etcd 存储值比对，任何不匹配即报错退出。
+# 因此加入节点必须显式指定与首节点相同的 critical config 值，否则 K3s 默认值
+# 与 etcd 存储值不匹配（例如 egress-selector-mode 默认非 disabled）就会报错。
 cat > /etc/systemd/system/k3s.service << EOF
 [Unit]
 Description=Lightweight Kubernetes
@@ -253,6 +253,7 @@ Type=notify
 EnvironmentFile=-/etc/rancher/k3s/k3s.env
 ExecStart=/usr/local/bin/k3s server \\
   --server=https://${FIRST_SERVER_ADDR}:${FIRST_SERVER_PORT} \\
+  --egress-selector-mode=disabled \\
   --advertise-address=${NODE_IP} \\
   --node-name=${NODE_NAME} \\
   --tls-san=${NODE_IP} \\
