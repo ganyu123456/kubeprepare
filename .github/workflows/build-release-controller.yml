@@ -123,18 +123,7 @@ jobs:
             "https://raw.githubusercontent.com/kubeedge/edgemesh/main/build/helm/edgemesh.tgz" \
             || echo "⚠️  EdgeMesh chart 下载失败，跳过"
 
-          echo "[2.7/3] 下载 nfs-common 离线 deb 包（${{ matrix.arch }}）..."
-          mkdir -p nfs
-          docker run --rm \
-            --platform ${{ matrix.dockerfile_platform }} \
-            -v "$(pwd)/nfs:/debs" \
-            ubuntu:22.04 bash -c "
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq
-              apt-get install -y --download-only --no-install-recommends nfs-common 2>/dev/null || true
-              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
-            "
-          echo "✓ nfs-common 离线包已下载: $(ls nfs/*.deb 2>/dev/null | wc -l) 个 deb"
+
 
           # 3. 准备脚本并打包
           echo "[3/3] 准备脚本并打包..."
@@ -184,11 +173,7 @@ jobs:
             echo "✓ 已包含 Helm Charts"
           fi
 
-          # 复制 nfs-common 离线包
-          if [ -d nfs ] && ls nfs/*.deb &>/dev/null 2>&1; then
-            cp -r nfs "$TEMP_PKG_DIR/"
-            echo "✓ 已包含 nfs-common 离线包 ($(ls nfs/*.deb | wc -l) 个 deb)"
-          fi
+
 
           cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
           K3s 额外控制节点离线安装包（HA 高可用扩容）

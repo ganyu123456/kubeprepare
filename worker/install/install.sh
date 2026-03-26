@@ -55,31 +55,7 @@ case "$ARCH" in
     ;;
 esac
 
-# ─────────────────────────────────────
-# 函数: 安装 nfs-common（离线优先，在线回退）
-# ─────────────────────────────────────
-install_nfs_common() {
-  if dpkg -l nfs-common 2>/dev/null | grep -q "^ii" || command -v mount.nfs4 &>/dev/null; then
-    echo "✓ nfs-common 已安装" | tee -a "$INSTALL_LOG"
-    return 0
-  fi
-  echo "[系统依赖] 安装 nfs-common（NFS 客户端，K8s NFS PVC 挂载必需）..." | tee -a "$INSTALL_LOG"
-  NFS_DIR=$(find "$SCRIPT_DIR" -maxdepth 2 -type d -name "nfs" 2>/dev/null | head -1)
-  if [ -n "$NFS_DIR" ] && ls "$NFS_DIR"/*.deb &>/dev/null 2>&1; then
-    echo "  使用离线 deb 包安装..." | tee -a "$INSTALL_LOG"
-    dpkg -i --force-depends "$NFS_DIR"/*.deb >> "$INSTALL_LOG" 2>&1 || true
-    apt-get install -f -y -qq >> "$INSTALL_LOG" 2>&1 || true
-  fi
-  if dpkg -l nfs-common 2>/dev/null | grep -q "^ii"; then
-    echo "✓ nfs-common 离线安装成功" | tee -a "$INSTALL_LOG"
-    return 0
-  fi
-  echo "  在线安装 nfs-common..." | tee -a "$INSTALL_LOG"
-  apt-get update -qq >> "$INSTALL_LOG" 2>&1 && \
-    apt-get install -y -qq nfs-common >> "$INSTALL_LOG" 2>&1 && \
-    echo "✓ nfs-common 在线安装成功" | tee -a "$INSTALL_LOG" || \
-    echo "⚠️  nfs-common 安装失败，NFS PVC 挂载可能受影响" | tee -a "$INSTALL_LOG"
-}
+
 
 # ─────────────────────────────────────
 # 函数: 安装 helm 到系统 PATH
@@ -122,8 +98,7 @@ if systemctl list-units --full -all 2>/dev/null | grep -q "k3s-agent.service"; t
 fi
 
 # 步骤0: 安装系统依赖
-echo "[0/3] 安装系统依赖（nfs-common、helm）..." | tee -a "$INSTALL_LOG"
-install_nfs_common
+echo "[0/3] 安装系统依赖（helm）..." | tee -a "$INSTALL_LOG"
 install_helm_to_path
 
 # 步骤1: 安装 k3s 二进制文件
@@ -192,7 +167,7 @@ systemctl enable k3s-agent
 echo "✓ k3s-agent 服务配置完成" | tee -a "$INSTALL_LOG"
 
 # 步骤3: 非阻塞启动，等待进程存活
-echo "[3/3] 启动 k3s-agent 服务..." | tee -a "$INSTALL_LOG"
+echo "[3/4] 启动 k3s-agent 服务..." | tee -a "$INSTALL_LOG"
 
 # --no-block 立即返回，避免 Type=notify+TimeoutStartSec=0 导致永久阻塞
 systemctl start --no-block k3s-agent
@@ -218,6 +193,47 @@ STATUS=$(systemctl is-active k3s-agent 2>/dev/null || echo "unknown")
 if [ "$STATUS" != "active" ]; then
   echo "⚠️  k3s-agent 启动超时，最终状态: $STATUS" | tee -a "$INSTALL_LOG"
   echo "   请手动检查: journalctl -u k3s-agent -f" | tee -a "$INSTALL_LOG"
+fi
+
+# 步骤4: 加载 K3s 系统镜像到 containerd
+echo "[4/4] 加载 K3s 系统镜像到 containerd..." | tee -a "$INSTALL_LOG"
+
+IMAGES_DIR=$(find "$SCRIPT_DIR" -type d -name "images" 2>/dev/null | head -1)
+
+if [ -n "$IMAGES_DIR" ] && [ -d "$IMAGES_DIR" ]; then
+  # 等待 containerd 就绪
+  echo "  等待 containerd 就绪..." | tee -a "$INSTALL_LOG"
+  for i in $(seq 1 30); do
+    if k3s ctr images ls >/dev/null 2>&1; then
+      echo "  ✓ containerd 已就绪" | tee -a "$INSTALL_LOG"
+      break
+    fi
+    if [ "$i" -eq 30 ]; then
+      echo "  ⚠️  containerd 等待超时，跳过镜像加载" | tee -a "$INSTALL_LOG"
+    fi
+    sleep 2
+  done
+
+  IMAGE_COUNT=$(find "$IMAGES_DIR" -name "*.tar" -type f 2>/dev/null | wc -l)
+  echo "  找到 $IMAGE_COUNT 个镜像文件" | tee -a "$INSTALL_LOG"
+
+  LOADED=0
+  FAILED=0
+  for image_tar in "$IMAGES_DIR"/*.tar; do
+    if [ -f "$image_tar" ]; then
+      image_name=$(basename "$image_tar")
+      if k3s ctr images import "$image_tar" >> "$INSTALL_LOG" 2>&1; then
+        LOADED=$((LOADED + 1))
+        echo "  ✓ $image_name" | tee -a "$INSTALL_LOG"
+      else
+        FAILED=$((FAILED + 1))
+        echo "  ✗ $image_name（失败）" | tee -a "$INSTALL_LOG"
+      fi
+    fi
+  done
+  echo "  镜像加载完成: $LOADED 成功, $FAILED 失败" | tee -a "$INSTALL_LOG"
+else
+  echo "  ⚠️  未找到镜像目录，跳过镜像加载" | tee -a "$INSTALL_LOG"
 fi
 
 echo "" | tee -a "$INSTALL_LOG"

@@ -68,7 +68,7 @@ jobs:
           echo "版本信息: K3s ${K3S_VERSION}"
 
           # 1. 下载 k3s 二进制文件
-          echo "[1/3] 下载 k3s 二进制文件..."
+          echo "[1/4] 下载 k3s 二进制文件..."
           if [ "${{ matrix.arch }}" = "amd64" ]; then
             K3S_DOWNLOAD_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s"
           else
@@ -79,50 +79,52 @@ jobs:
           chmod +x "k3s-${{ matrix.arch }}"
           echo "✓ k3s 下载完成"
 
-          # 1.5. 下载 Helm + Helm Charts + nfs-common 离线包
-          echo "[1.5/3] 下载 Helm 二进制文件..."
+          # 2. 下载 K3s 系统镜像
+          echo "[2/4] 下载 K3s 系统镜像..."
+          mkdir -p images
+          K3S_IMAGES=(
+            "docker.io/rancher/klipper-lb:v0.4.13"
+            "docker.io/rancher/mirrored-pause:3.6"
+            "docker.io/kubeedge/iptables-manager:v1.22.0"
+            "docker.io/kubeedge/edgemesh-agent:v1.17.0"
+          )
+          for image in "${K3S_IMAGES[@]}"; do
+            echo "  拉取镜像: $image"
+            docker pull --platform ${{ matrix.dockerfile_platform }} "$image" \
+              || (echo "❌ 错误：无法拉取镜像 $image" && exit 1)
+            filename=$(echo "$image" | sed 's/[\\/:]/-/g')
+            docker save "$image" -o "images/${filename}.tar" \
+              || (echo "❌ 错误：无法保存镜像 $image" && exit 1)
+          done
+          echo "✓ K3s 系统镜像处理完成"
+
+          # 3. 下载其他依赖
+          echo "[3/4] 下载其他依赖（Helm、Chart、NFS）..."
+          # 下载 Helm
           HELM_TAR="helm-${HELM_VERSION}-linux-${{ matrix.arch }}.tar.gz"
-          wget -q -O helm.tar.gz "https://get.helm.sh/${HELM_TAR}" \
-            || (echo "❌ 错误：无法下载 Helm" && exit 1)
-          tar -xzf helm.tar.gz
-          mv linux-${{ matrix.arch }}/helm ./helm
-          chmod +x ./helm
+          wget -q -O helm.tar.gz "https://get.helm.sh/${HELM_TAR}" || (echo "❌ 错误：无法下载 Helm" && exit 1)
+          tar -xzf helm.tar.gz && mv linux-${{ matrix.arch }}/helm ./helm && chmod +x ./helm
           rm -rf linux-${{ matrix.arch }} helm.tar.gz
           echo "✓ Helm 下载完成 (${HELM_VERSION})"
 
-          echo "[1.6/3] 下载 EdgeMesh Helm Chart..."
+          # 下载 EdgeMesh Helm Chart
           mkdir -p helm-charts
           wget -q -O helm-charts/edgemesh.tgz \
             "https://raw.githubusercontent.com/kubeedge/edgemesh/main/build/helm/edgemesh.tgz" \
             || echo "⚠️  EdgeMesh chart 下载失败，跳过"
 
-          echo "[1.7/3] 下载 nfs-common 离线 deb 包（${{ matrix.arch }}）..."
-          mkdir -p nfs
-          docker run --rm \
-            --platform ${{ matrix.dockerfile_platform }} \
-            -v "$(pwd)/nfs:/debs" \
-            ubuntu:22.04 bash -c "
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq
-              apt-get install -y --download-only --no-install-recommends nfs-common 2>/dev/null || true
-              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
-            "
-          echo "✓ nfs-common 离线包已下载: $(ls nfs/*.deb 2>/dev/null | wc -l) 个 deb"
 
-          # 2. 准备安装脚本
-          echo "[2/3] 准备安装脚本..."
+
+          # 4. 准备安装脚本和打包
+          echo "[4/4] 准备安装脚本和打包..."
           INSTALL_SCRIPT="${GITHUB_WORKSPACE}/worker/install/install.sh"
           CLEANUP_SCRIPT="${GITHUB_WORKSPACE}/worker/install/cleanup.sh"
-
           if [ ! -f "$INSTALL_SCRIPT" ]; then
             echo "❌ 错误：找不到安装脚本 $INSTALL_SCRIPT"
-            ls -la "${GITHUB_WORKSPACE}/worker/install/" || echo "worker/install 目录不存在"
             exit 1
           fi
-          echo "✓ 安装脚本就绪: $INSTALL_SCRIPT"
+          echo "✓ 安装脚本就绪"
 
-          # 3. 创建安装元数据
-          echo "[3/3] 创建安装元数据和打包..."
           mkdir -p meta
           cat > meta/version.txt << EOFMETA
           k3s_version=${K3S_VERSION}
@@ -132,9 +134,8 @@ jobs:
           EOFMETA
           echo "✓ 安装元数据已创建"
 
-          # 打包离线安装包
+          # 打包
           PACKAGE_NAME="k3s-worker-${K3S_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
-
           TEMP_PKG_DIR="$(mktemp -d)"
           trap "rm -rf $TEMP_PKG_DIR" EXIT
 
@@ -142,28 +143,11 @@ jobs:
           cp "k3s-${{ matrix.arch }}" "$TEMP_PKG_DIR/"
           cp -r meta "$TEMP_PKG_DIR/"
           cp "$INSTALL_SCRIPT" "$TEMP_PKG_DIR/"
-          if [ -f "$CLEANUP_SCRIPT" ]; then
-            cp "$CLEANUP_SCRIPT" "$TEMP_PKG_DIR/"
-            echo "✓ 已包含 cleanup.sh 清理脚本"
-          fi
+          [ -f "$CLEANUP_SCRIPT" ] && cp "$CLEANUP_SCRIPT" "$TEMP_PKG_DIR/" && echo "✓ 已包含 cleanup.sh"
+          [ -f helm ] && cp helm "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm"
+          [ -d images ] && cp -r images "$TEMP_PKG_DIR/" && echo "✓ 已包含 K3s 系统镜像"
+          [ -d helm-charts ] && ls helm-charts/*.tgz &>/dev/null && cp -r helm-charts "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm Charts"
 
-          # 复制 Helm 二进制文件
-          if [ -f helm ]; then
-            cp helm "$TEMP_PKG_DIR/"
-            echo "✓ 已包含 Helm 二进制文件"
-          fi
-
-          # 复制 EdgeMesh Helm chart
-          if [ -d helm-charts ] && ls helm-charts/*.tgz &>/dev/null 2>&1; then
-            cp -r helm-charts "$TEMP_PKG_DIR/"
-            echo "✓ 已包含 Helm Charts"
-          fi
-
-          # 复制 nfs-common 离线包
-          if [ -d nfs ] && ls nfs/*.deb &>/dev/null 2>&1; then
-            cp -r nfs "$TEMP_PKG_DIR/"
-            echo "✓ 已包含 nfs-common 离线包 ($(ls nfs/*.deb | wc -l) 个 deb)"
-          fi
 
           # 生成包内说明文件
           cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
