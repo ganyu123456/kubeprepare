@@ -84,6 +84,7 @@ jobs:
           mkdir -p images
           K3S_IMAGES=(
             "docker.io/rancher/klipper-lb:v0.4.13"
+            "docker.io/rancher/mirrored-pause:3.6"
             "docker.io/kubeedge/iptables-manager:v1.22.0"
             "docker.io/kubeedge/edgemesh-agent:v1.17.0"
           )
@@ -146,7 +147,6 @@ jobs:
           [ -f helm ] && cp helm "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm"
           [ -d images ] && cp -r images "$TEMP_PKG_DIR/" && echo "✓ 已包含 K3s 系统镜像"
           [ -d helm-charts ] && ls helm-charts/*.tgz &>/dev/null && cp -r helm-charts "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm Charts"
-          [ -d nfs ] && ls nfs/*.deb &>/dev/null && cp -r nfs "$TEMP_PKG_DIR/" && echo "✓ 已包含 nfs-common 离线包"
 
 
           # 生成包内说明文件
