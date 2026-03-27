@@ -93,17 +93,19 @@ jobs:
           echo "✓ KubeEdge keadm 下载完成"
           
           # 3. 下载 containerd 和 runc
-          echo "[3/6] 下载 containerd 和 runc..."
-          CONTAINERD_URL="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${{ matrix.arch }}.tar.gz"
-          if ! wget -q -O containerd.tar.gz "$CONTAINERD_URL"; then
-            echo "警告：无法下载 containerd v${CONTAINERD_VERSION}，尝试备用版本 v1.6.0"
-            CONTAINERD_URL="https://github.com/containerd/containerd/releases/download/v1.6.0/containerd-1.6.0-linux-${{ matrix.arch }}.tar.gz"
-            wget -q -O containerd.tar.gz "$CONTAINERD_URL" || (echo "错误：containerd 下载失败，离线包将无法运行容器" && exit 1)
+          # 使用 containerd-static（静态编译版），不依赖 GLIBC 版本
+          # 兼容：麒麟V10（GLIBC 2.28）、CentOS 8、Ubuntu 18.04 等所有 Linux 发行版
+          echo "[3/6] 下载 containerd-static 和 runc..."
+          CONTAINERD_STATIC_URL="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-static-${CONTAINERD_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          if ! wget -q -O containerd.tar.gz "$CONTAINERD_STATIC_URL"; then
+            echo "警告：无法下载 containerd-static v${CONTAINERD_VERSION}，尝试备用版本 v1.7.24（静态）"
+            CONTAINERD_STATIC_URL="https://github.com/containerd/containerd/releases/download/v1.7.24/containerd-static-1.7.24-linux-${{ matrix.arch }}.tar.gz"
+            wget -q -O containerd.tar.gz "$CONTAINERD_STATIC_URL" || (echo "错误：containerd-static 下载失败，离线包将无法运行容器" && exit 1)
           fi
           
           tar -xzf containerd.tar.gz || (echo "错误：containerd 解压失败" && exit 1)
           rm containerd.tar.gz
-          echo "✓ containerd 下载完成"
+          echo "✓ containerd-static 下载完成（兼容 GLIBC 2.28+，适用于麒麟V10/CentOS8）"
           
           # 下载 runc
           RUNC_URL="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.${{ matrix.arch }}"
