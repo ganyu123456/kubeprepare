@@ -455,79 +455,75 @@ jobs:
             echo "  ✓ values/ 自定义目录"
           fi
 
+          # 预先生成镜像清单文本（避免在 heredoc 中嵌套 Python 脚本导致缩进问题）
+          IMAGE_LIST_TEXT=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            SRC=$(python3 -c "import sys,json;d=json.loads(sys.argv[1]);print(d['source'])" "$line" 2>/dev/null) || continue
+            HP=$(python3 -c "import sys,json;d=json.loads(sys.argv[1]);print(d['harbor_path'])" "$line" 2>/dev/null) || continue
+            IMAGE_LIST_TEXT="${IMAGE_LIST_TEXT}  ${SRC}\n    -> <harbor-addr>/${HP}\n"
+          done < work/images/manifest.jsonl
+
           # 写 README
-          cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
-PostgreSQL 离线安装包
-=====================
-Chart:      bitnami/postgresql ${CHART_VERSION}
-构建时间:   $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-构建版本:   ${TAG_VERSION}
-架构:       ${{ matrix.arch }}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-目录结构
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-charts/
-  postgresql-${CHART_VERSION}.tgz    ← 自包含 Helm chart（含 common 依赖）
-  common-x.x.x.tgz               ← bitnami/common 依赖 chart（独立推送用）
-
-images/
-  *.tar                           ← 所有容器镜像 tar 包
-  manifest.jsonl                  ← 镜像清单（源镜像 → Harbor 路径映射）
-
-install.sh           ← 一键安装脚本
-load-images.sh       ← 镜像导入/推送脚本
-cleanup.sh           ← 卸载脚本
-helm                 ← Helm 二进制（免安装，直接使用）
-values-offline.yaml.tpl ← 离线 values 模板（HARBOR_ADDR 占位符）
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-快速安装
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1. 一键安装（自动推送镜像和 chart 到 Harbor，然后安装）
-sudo ./install.sh <harbor-addr> [namespace] [release-name]
-
-# 示例
-sudo ./install.sh harbor.example.com postgresql my-postgresql
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-分步操作
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 仅推送镜像到 Harbor
-./load-images.sh harbor.example.com [harbor-user] [harbor-password]
-
-# 仅从本地 chart tgz 安装（无需 Harbor chart 仓库）
-sed 's|HARBOR_ADDR|harbor.example.com|g' values-offline.yaml.tpl > /tmp/values.yaml
-./helm install postgresql ./charts/postgresql-${CHART_VERSION}.tgz \\
-  -n postgresql --create-namespace -f /tmp/values.yaml
-
-# 卸载
-./cleanup.sh [namespace] [release-name]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-镜像清单（Harbor 推送目标）
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-$(cat work/images/manifest.jsonl | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if line:
-        d = json.loads(line)
-        print(f\"  {d['source']}\")
-        print(f\"    → <harbor-addr>/{d['harbor_path']}\")
-" 2>/dev/null || cat work/images/manifest.jsonl)
-EOFREADME
+          # 注意: heredoc 内容必须与 run: 块保持一致缩进（YAML literal block scalar 要求）
+          # YAML 解析时会自动去除公共前缀空格，shell 最终看到的内容无多余前缀
+          # 使用 printf 生成 README（避免 heredoc 0缩进破坏 YAML block scalar）
+          {
+            printf "PostgreSQL 离线安装包\n"
+            printf "=====================\n"
+            printf "Chart:      bitnami/postgresql %s\n" "${CHART_VERSION}"
+            printf "构建时间:   %s\n" "$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            printf "构建版本:   %s\n" "${TAG_VERSION}"
+            printf "架构:       %s\n" "${{ matrix.arch }}"
+            printf "\n"
+            printf "目录结构\n"
+            printf "--------\n"
+            printf "charts/\n"
+            printf "  postgresql-%s.tgz  (自包含 Helm chart，含 common 依赖)\n" "${CHART_VERSION}"
+            printf "  common-x.x.x.tgz   (bitnami/common 依赖 chart)\n"
+            printf "\n"
+            printf "images/\n"
+            printf "  *.tar              (所有容器镜像 tar 包)\n"
+            printf "  manifest.jsonl     (镜像清单，源镜像 -> Harbor 路径映射)\n"
+            printf "\n"
+            printf "install.sh           一键安装脚本\n"
+            printf "load-images.sh       镜像导入/推送脚本\n"
+            printf "cleanup.sh           卸载脚本\n"
+            printf "helm                 Helm 二进制（免安装，直接使用）\n"
+            printf "values-offline.yaml.tpl  离线 values 模板（HARBOR_ADDR 占位符）\n"
+            printf "\n"
+            printf "快速安装\n"
+            printf "--------\n"
+            printf "sudo ./install.sh <harbor-addr> [namespace] [release-name]\n"
+            printf "\n"
+            printf "示例: sudo ./install.sh harbor.example.com postgresql my-postgresql\n"
+            printf "\n"
+            printf "分步操作\n"
+            printf "--------\n"
+            printf "./load-images.sh harbor.example.com [user] [password]\n"
+            printf "\n"
+            printf "# 本地 chart tgz 直接安装:\n"
+            printf "sed 's|HARBOR_ADDR|harbor.example.com|g' values-offline.yaml.tpl > /tmp/values.yaml\n"
+            printf "./helm install postgresql ./charts/postgresql-%s.tgz \\\\\n" "${CHART_VERSION}"
+            printf "  -n postgresql --create-namespace -f /tmp/values.yaml\n"
+            printf "\n"
+            printf "# 卸载: ./cleanup.sh [namespace] [release-name]\n"
+            printf "\n"
+            printf "镜像清单（Harbor 推送目标）\n"
+            printf "--------------------------\n"
+            printf "%b" "$IMAGE_LIST_TEXT"
+          } > "$TEMP_PKG_DIR/README.txt"
 
           # 写 meta 信息
           mkdir -p "$TEMP_PKG_DIR/meta"
-          cat > "$TEMP_PKG_DIR/meta/version.txt" << EOFMETA
-chart_name=${CHART_NAME}
-chart_version=${CHART_VERSION}
-helm_version=${HELM_VERSION}
-arch=${{ matrix.arch }}
-build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-tag=${TAG_VERSION}
-EOFMETA
+          {
+            echo "chart_name=${CHART_NAME}"
+            echo "chart_version=${CHART_VERSION}"
+            echo "helm_version=${HELM_VERSION}"
+            echo "arch=${{ matrix.arch }}"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "tag=${TAG_VERSION}"
+          } > "$TEMP_PKG_DIR/meta/version.txt"
 
           # 打包
           tar -czf "${PACKAGE_NAME}" -C "$TEMP_PKG_DIR" .
