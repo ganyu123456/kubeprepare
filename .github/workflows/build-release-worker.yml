@@ -79,24 +79,43 @@ jobs:
           chmod +x "k3s-${{ matrix.arch }}"
           echo "✓ k3s 下载完成"
 
-          # 2. 下载 K3s 系统镜像
-          echo "[2/4] 下载 K3s 系统镜像..."
+          # 2. 下载 K3s 官方 airgap 镜像包 + KubeEdge 附加镜像
+          # K3s airgap 包含所有 K3s 内置镜像（pause、coredns、traefik、metrics-server 等）
+          # 这是 K3s 官方推荐的离线部署方式，镜像放入 /var/lib/rancher/k3s/agent/images/ 后 K3s 自动导入
+          echo "[2/4] 下载 K3s airgap 镜像包 + KubeEdge 附加镜像..."
           mkdir -p images
-          K3S_IMAGES=(
-            "docker.io/rancher/klipper-lb:v0.4.13"
-            "docker.io/rancher/mirrored-pause:3.6"
+
+          # 2a. 下载 K3s 官方 airgap 镜像包（含 pause、coredns、traefik、metrics-server 等所有内置镜像）
+          AIRGAP_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s-airgap-images-${{ matrix.arch }}.tar.zst"
+          echo "  下载 K3s airgap 镜像包: $AIRGAP_URL"
+          if ! wget -q --show-progress -O "images/k3s-airgap-images-${{ matrix.arch }}.tar.zst" "$AIRGAP_URL"; then
+            echo "❌ 错误：K3s airgap 镜像包下载失败，离线包将无法纯离线运行"
+            exit 1
+          fi
+          echo "  ✓ K3s airgap 镜像包下载完成 ($(du -h images/k3s-airgap-images-${{ matrix.arch }}.tar.zst | cut -f1))"
+
+          # 2b. 下载 KubeEdge 附加镜像（cloud-iptables-manager、edgemesh-agent 等 K3s 内置包里没有的）
+          KUBEEDGE_EXTRA_IMAGES=(
             "docker.io/kubeedge/iptables-manager:v1.22.0"
             "docker.io/kubeedge/edgemesh-agent:v1.17.0"
           )
-          for image in "${K3S_IMAGES[@]}"; do
-            echo "  拉取镜像: $image"
+          for image in "${KUBEEDGE_EXTRA_IMAGES[@]}"; do
+            echo "  拉取 KubeEdge 附加镜像: $image"
             docker pull --platform ${{ matrix.dockerfile_platform }} "$image" \
               || (echo "❌ 错误：无法拉取镜像 $image" && exit 1)
-            filename=$(echo "$image" | sed 's/[\\/:]/-/g')
+            filename=$(echo "$image" | sed 's/[\/:]/-/g')
             docker save "$image" -o "images/${filename}.tar" \
               || (echo "❌ 错误：无法保存镜像 $image" && exit 1)
+            echo "  ✓ $image"
           done
-          echo "✓ K3s 系统镜像处理完成"
+
+          # 校验镜像目录非空（防止静默跳过导致离线包缺少镜像）
+          IMAGE_COUNT=$(find images -type f \( -name "*.tar" -o -name "*.tar.zst" \) | wc -l)
+          if [ "$IMAGE_COUNT" -lt 3 ]; then
+            echo "❌ 错误：镜像目录文件数量不足（期望 ≥3，实际 ${IMAGE_COUNT}），离线包不完整"
+            exit 1
+          fi
+          echo "✓ 镜像准备完成（共 ${IMAGE_COUNT} 个文件）"
 
           # 3. 下载其他依赖
           echo "[3/4] 下载其他依赖（Helm、Chart、NFS）..."
@@ -145,7 +164,13 @@ jobs:
           cp "$INSTALL_SCRIPT" "$TEMP_PKG_DIR/"
           [ -f "$CLEANUP_SCRIPT" ] && cp "$CLEANUP_SCRIPT" "$TEMP_PKG_DIR/" && echo "✓ 已包含 cleanup.sh"
           [ -f helm ] && cp helm "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm"
-          [ -d images ] && cp -r images "$TEMP_PKG_DIR/" && echo "✓ 已包含 K3s 系统镜像"
+          # 强制校验镜像目录存在且非空，离线安装必须有镜像
+          if [ ! -d images ] || [ "$(find images -type f \( -name '*.tar' -o -name '*.tar.zst' \) | wc -l)" -lt 3 ]; then
+            echo "❌ 错误：images 目录不存在或镜像不完整，终止打包"
+            exit 1
+          fi
+          cp -r images "$TEMP_PKG_DIR/"
+          echo "✓ 已包含 K3s 系统镜像（$(find images -type f \( -name '*.tar' -o -name '*.tar.zst' \) | wc -l) 个文件）"
           [ -d helm-charts ] && ls helm-charts/*.tgz &>/dev/null && cp -r helm-charts "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm Charts"
 
 

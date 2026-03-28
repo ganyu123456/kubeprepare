@@ -102,7 +102,7 @@ echo "[0/3] 安装系统依赖（helm）..." | tee -a "$INSTALL_LOG"
 install_helm_to_path
 
 # 步骤1: 安装 k3s 二进制文件
-echo "[1/3] 安装 k3s 二进制文件..." | tee -a "$INSTALL_LOG"
+echo "[1/4] 安装 k3s 二进制文件..." | tee -a "$INSTALL_LOG"
 K3S_BIN=$(find "$SCRIPT_DIR" -name "k3s-${ARCH}" -type f 2>/dev/null | head -1)
 if [ -z "$K3S_BIN" ]; then
   echo "❌ 错误: 未在 $SCRIPT_DIR 中找到 k3s-${ARCH} 二进制文件" | tee -a "$INSTALL_LOG"
@@ -119,8 +119,39 @@ cp "$K3S_BIN" /usr/local/bin/k3s
 chmod +x /usr/local/bin/k3s
 echo "✓ k3s 二进制文件已安装: $(k3s --version 2>/dev/null | head -1)" | tee -a "$INSTALL_LOG"
 
-# 步骤2: 创建 k3s-agent systemd 服务（参照官方 k3s install 脚本方式）
-echo "[2/3] 配置 k3s-agent systemd 服务..." | tee -a "$INSTALL_LOG"
+# 步骤2: 预置离线镜像到 K3s airgap 目录（必须在 K3s 启动之前完成）
+# K3s 启动时会自动导入 /var/lib/rancher/k3s/agent/images/ 下的所有镜像文件
+# 这是 K3s 官方推荐的离线部署方式，确保 pause 等 sandbox 镜像在调度前就已就绪
+echo "[2/4] 预置 K3s 离线镜像（K3s airgap 方式）..." | tee -a "$INSTALL_LOG"
+
+IMAGES_DIR=$(find "$SCRIPT_DIR" -type d -name "images" 2>/dev/null | head -1)
+
+if [ -z "$IMAGES_DIR" ] || [ ! -d "$IMAGES_DIR" ]; then
+  echo "❌ 错误: 离线包中未找到 images 目录，无法纯离线安装" | tee -a "$INSTALL_LOG"
+  echo "   请重新下载完整的离线包（包含 images/ 目录）" | tee -a "$INSTALL_LOG"
+  exit 1
+fi
+
+IMAGE_FILE_COUNT=$(find "$IMAGES_DIR" -type f \( -name "*.tar" -o -name "*.tar.zst" -o -name "*.tar.gz" \) | wc -l)
+if [ "$IMAGE_FILE_COUNT" -eq 0 ]; then
+  echo "❌ 错误: images 目录为空，离线包不完整" | tee -a "$INSTALL_LOG"
+  exit 1
+fi
+
+# 创建 K3s airgap 镜像目录并复制所有镜像文件
+K3S_AIRGAP_DIR="/var/lib/rancher/k3s/agent/images"
+mkdir -p "$K3S_AIRGAP_DIR"
+
+echo "  复制 ${IMAGE_FILE_COUNT} 个镜像文件到 K3s airgap 目录..." | tee -a "$INSTALL_LOG"
+find "$IMAGES_DIR" -type f \( -name "*.tar" -o -name "*.tar.zst" -o -name "*.tar.gz" \) | while read -r img_file; do
+  img_name=$(basename "$img_file")
+  cp "$img_file" "$K3S_AIRGAP_DIR/"
+  echo "  ✓ $img_name → $K3S_AIRGAP_DIR/" | tee -a "$INSTALL_LOG"
+done
+echo "✓ 离线镜像已就绪，K3s 启动时将自动导入" | tee -a "$INSTALL_LOG"
+
+# 步骤3: 创建 k3s-agent systemd 服务
+echo "[3/4] 配置 k3s-agent systemd 服务..." | tee -a "$INSTALL_LOG"
 
 # 用环境文件传参，与官方 k3s 在线安装方式保持一致
 # 注意：node-role.kubernetes.io/* 是受保护前缀，不能通过 --node-label 由节点自己设置
@@ -166,8 +197,8 @@ systemctl daemon-reload
 systemctl enable k3s-agent
 echo "✓ k3s-agent 服务配置完成" | tee -a "$INSTALL_LOG"
 
-# 步骤3: 非阻塞启动，等待进程存活
-echo "[3/4] 启动 k3s-agent 服务..." | tee -a "$INSTALL_LOG"
+# 步骤4: 启动 K3s agent（airgap 镜像已在步骤2预置，K3s 启动时自动导入）
+echo "[4/4] 启动 k3s-agent 服务..." | tee -a "$INSTALL_LOG"
 
 # --no-block 立即返回，避免 Type=notify+TimeoutStartSec=0 导致永久阻塞
 systemctl start --no-block k3s-agent
@@ -193,47 +224,6 @@ STATUS=$(systemctl is-active k3s-agent 2>/dev/null || echo "unknown")
 if [ "$STATUS" != "active" ]; then
   echo "⚠️  k3s-agent 启动超时，最终状态: $STATUS" | tee -a "$INSTALL_LOG"
   echo "   请手动检查: journalctl -u k3s-agent -f" | tee -a "$INSTALL_LOG"
-fi
-
-# 步骤4: 加载 K3s 系统镜像到 containerd
-echo "[4/4] 加载 K3s 系统镜像到 containerd..." | tee -a "$INSTALL_LOG"
-
-IMAGES_DIR=$(find "$SCRIPT_DIR" -type d -name "images" 2>/dev/null | head -1)
-
-if [ -n "$IMAGES_DIR" ] && [ -d "$IMAGES_DIR" ]; then
-  # 等待 containerd 就绪
-  echo "  等待 containerd 就绪..." | tee -a "$INSTALL_LOG"
-  for i in $(seq 1 30); do
-    if k3s ctr images ls >/dev/null 2>&1; then
-      echo "  ✓ containerd 已就绪" | tee -a "$INSTALL_LOG"
-      break
-    fi
-    if [ "$i" -eq 30 ]; then
-      echo "  ⚠️  containerd 等待超时，跳过镜像加载" | tee -a "$INSTALL_LOG"
-    fi
-    sleep 2
-  done
-
-  IMAGE_COUNT=$(find "$IMAGES_DIR" -name "*.tar" -type f 2>/dev/null | wc -l)
-  echo "  找到 $IMAGE_COUNT 个镜像文件" | tee -a "$INSTALL_LOG"
-
-  LOADED=0
-  FAILED=0
-  for image_tar in "$IMAGES_DIR"/*.tar; do
-    if [ -f "$image_tar" ]; then
-      image_name=$(basename "$image_tar")
-      if k3s ctr images import "$image_tar" >> "$INSTALL_LOG" 2>&1; then
-        LOADED=$((LOADED + 1))
-        echo "  ✓ $image_name" | tee -a "$INSTALL_LOG"
-      else
-        FAILED=$((FAILED + 1))
-        echo "  ✗ $image_name（失败）" | tee -a "$INSTALL_LOG"
-      fi
-    fi
-  done
-  echo "  镜像加载完成: $LOADED 成功, $FAILED 失败" | tee -a "$INSTALL_LOG"
-else
-  echo "  ⚠️  未找到镜像目录，跳过镜像加载" | tee -a "$INSTALL_LOG"
 fi
 
 echo "" | tee -a "$INSTALL_LOG"
