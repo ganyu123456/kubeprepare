@@ -16,7 +16,7 @@ CLOUD_ADDRESS="${1:-}"
 EDGE_TOKEN="${2:-}"
 NODE_NAME="${3:-}"
 KUBEEDGE_VERSION="1.22.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_LOG="/var/log/kubeedge-edge-install.log"
 
 # 验证参数
