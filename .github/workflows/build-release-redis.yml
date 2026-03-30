@@ -1,0 +1,593 @@
+name: 构建和发布 Redis 离线包
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 工作流说明:
+#   基于 redis-23.1.1.tgz（bitnami/redis）构建完整的离线安装包。
+#   产物包含:
+#     charts/         - 自包含 Helm chart（已内嵌依赖）及依赖 chart
+#     images/         - 所有容器镜像 tar 包 + 镜像 manifest（源→Harbor 映射）
+#     install.sh      - 一键安装脚本（参数: harbor-addr, namespace, release-name）
+#     load-images.sh  - 镜像导入/推送脚本
+#     cleanup.sh      - 卸载脚本
+#     helm            - Helm 二进制文件（内嵌，无需预装）
+#     values-offline.yaml.tpl - 离线安装 values 模板（HARBOR_ADDR 占位符）
+#
+# 安装时:
+#   镜像推送目标: harbor.xxx/library/<image-name>:<tag>
+#   Chart  推送目标: oci://harbor.xxx/charts
+#
+# bitnami/redis 23.1.1 包含的镜像:
+#   - bitnami/redis          (主镜像，master/replica 节点)
+#   - bitnami/redis-sentinel (Sentinel 模式使用)
+#   - bitnami/redis-exporter (Prometheus metrics 导出)
+#   - bitnami/os-shell       (volumePermissions init container)
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags:
+      - 'v*'
+    paths:
+      - 'redis/**'
+      - '.github/workflows/build-release-redis.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CHART_NAME: "redis"
+  CHART_VERSION: "23.1.1"
+  HELM_VERSION: "v3.19.2"
+
+jobs:
+  build-redis:
+    runs-on: ubuntu-latest
+    name: 构建并发布 Redis 离线包 (${{ matrix.arch }})
+    strategy:
+      fail-fast: false          # 某一架构失败不影响另一架构继续构建
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            docker_platform: linux/amd64
+          - arch: arm64
+            docker_platform: linux/arm64
+
+    steps:
+      # ─────────────────────────────────────
+      # 步骤 0: 设置 QEMU（arm64 跨架构拉取镜像必需）
+      # ─────────────────────────────────────
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.docker_platform }}
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ─────────────────────────────────────
+      # 步骤 1: 检出代码
+      # ─────────────────────────────────────
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────
+      # 步骤 2: 设置环境变量
+      # ─────────────────────────────────────
+      - name: 设置环境变量
+        id: set_env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_VERSION="manual-redis-${GITHUB_SHA::7}"
+          else
+            TAG_VERSION=${GITHUB_REF#refs/tags/}
+            if [ -z "$TAG_VERSION" ]; then
+              echo "❌ 错误：未能解析到 tag，请使用 tag 触发或手动触发" >&2
+              exit 1
+            fi
+          fi
+          echo "TAG_VERSION=${TAG_VERSION}" >> $GITHUB_ENV
+          echo "tag_version=${TAG_VERSION}" >> $GITHUB_OUTPUT
+          echo "PACKAGE_NAME=redis-offline-${CHART_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz" >> $GITHUB_ENV
+          echo "✓ TAG_VERSION=${TAG_VERSION}, ARCH=${{ matrix.arch }}"
+
+      # ─────────────────────────────────────
+      # 步骤 3: 安装构建工具（Helm + Python PyYAML）
+      # ─────────────────────────────────────
+      - name: 安装构建工具
+        run: |
+          set -euo pipefail
+
+          echo "=== 安装 Helm ${HELM_VERSION} (amd64，用于 CI 构建本机) ==="
+          # 注意：此处下载 amd64 版 helm 用于 CI 运行环境（ubuntu-latest 均为 amd64）
+          # 离线包内嵌的 helm 会单独按目标架构下载（步骤8）
+          wget -q -O helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+            || { echo "❌ Helm 下载失败"; exit 1; }
+          tar -xzf helm.tar.gz
+          sudo mv "linux-amd64/helm" /usr/local/bin/helm
+          rm -rf "linux-amd64" helm.tar.gz
+          echo "✓ Helm 版本: $(helm version --short)"
+
+          echo "=== 安装 Python 依赖 ==="
+          pip3 install pyyaml --quiet
+          echo "✓ pyyaml 已安装"
+
+      # ─────────────────────────────────────
+      # 步骤 4: 获取 Chart 并内嵌依赖
+      # ─────────────────────────────────────
+      - name: 获取 Chart 并内嵌依赖
+        run: |
+          set -euo pipefail
+
+          echo "=== [1/5] 获取 Chart: ${CHART_NAME}-${CHART_VERSION} ==="
+          mkdir -p work/charts_output work/chart_src
+
+          echo "目标架构: ${{ matrix.arch }}"
+          echo ""
+
+          # 优先使用 repo 中预置的 chart（可在 redis/charts/ 目录放置）
+          PRESET="${GITHUB_WORKSPACE}/redis/charts/${CHART_NAME}-${CHART_VERSION}.tgz"
+          if [ -f "$PRESET" ]; then
+            echo "  ✓ 使用预置 chart: $PRESET"
+            cp "$PRESET" "work/${CHART_NAME}-${CHART_VERSION}.tgz"
+          else
+            echo "  从 Bitnami 下载 chart..."
+            # 优先尝试 OCI 方式（Bitnami 新版），回退到 helm repo
+            if helm pull "oci://registry-1.docker.io/bitnamicharts/${CHART_NAME}" \
+                --version "${CHART_VERSION}" -d work/ 2>/dev/null; then
+              echo "  ✓ OCI 方式下载成功"
+            else
+              echo "  OCI 方式失败，尝试 helm repo 方式..."
+              helm repo add bitnami https://charts.bitnami.com/bitnami --force-update 2>/dev/null
+              helm pull "bitnami/${CHART_NAME}" --version "${CHART_VERSION}" -d work/ \
+                || { echo "❌ Chart 下载失败"; exit 1; }
+            fi
+          fi
+
+          echo "  下载的 chart 文件:"
+          ls -lh work/*.tgz
+
+          echo ""
+          echo "=== 解压 Chart、下载依赖、重新打包（内嵌依赖）==="
+          # 解压到 chart_src 目录
+          tar -xzf "work/${CHART_NAME}-${CHART_VERSION}.tgz" -C work/chart_src/
+
+          # 下载依赖（bitnami/common 等），内嵌到 charts/ 子目录
+          echo "  执行 helm dependency update..."
+          helm dependency update "work/chart_src/${CHART_NAME}/" 2>&1 | sed 's/^/  /'
+
+          # 重新打包（此时依赖已内嵌，为自包含 chart）
+          helm package "work/chart_src/${CHART_NAME}/" --destination work/charts_output/ \
+            || { echo "❌ Chart 打包失败"; exit 1; }
+          echo "  ✓ 自包含 chart 已生成:"
+          ls -lh work/charts_output/
+
+          # 同时单独保存依赖 chart（供 Harbor OCI 仓库分别推送使用）
+          DEP_DIR="work/chart_src/${CHART_NAME}/charts"
+          if [ -d "$DEP_DIR" ] && ls "$DEP_DIR"/*.tgz &>/dev/null 2>&1; then
+            cp "$DEP_DIR"/*.tgz work/charts_output/
+            echo "  ✓ 已保存依赖 chart:"
+            ls -lh "$DEP_DIR"/*.tgz
+          fi
+
+      # ─────────────────────────────────────
+      # 步骤 5: 提取镜像列表
+      # ─────────────────────────────────────
+      - name: 提取镜像列表
+        run: |
+          set -euo pipefail
+
+          echo "=== [2/5] 从 Chart values 提取镜像列表 ==="
+
+          # 提取 chart values（使用自包含版本）
+          CHART_TGZ=$(ls work/charts_output/${CHART_NAME}-*.tgz | head -1)
+          helm show values "$CHART_TGZ" > work/chart-values.yaml
+          echo "  ✓ chart values 提取完成（$(wc -l < work/chart-values.yaml) 行）"
+
+          # Python 脚本：递归查找所有 registry+repository+tag 组合
+          # bitnami/redis values 结构较复杂，镜像分散在多个 key 下:
+          #   image.*                  (redis 主镜像)
+          #   sentinel.image.*         (redis-sentinel)
+          #   metrics.image.*          (redis-exporter)
+          #   volumePermissions.image.* (os-shell)
+          #   sysctlImage.*            (os-shell，旧版字段)
+          cat > /tmp/extract_images.py << 'PYEOF'
+          import yaml, sys, re
+
+          def normalize_registry(registry):
+              """统一 docker.io 的写法"""
+              if not registry or registry == 'docker.io':
+                  return 'docker.io'
+              return registry
+
+          def find_images(obj, path=None):
+              if path is None:
+                  path = []
+              images = []
+              if isinstance(obj, dict):
+                  # 识别 image 定义块: 含有 repository + tag 的 dict
+                  repo = obj.get('repository', '')
+                  tag = obj.get('tag', '')
+                  if repo and tag and isinstance(repo, str) and isinstance(tag, (str, int)):
+                      tag = str(tag)
+                      # 跳过空占位符和无效值
+                      if not repo.startswith('~') and repo != '' and tag != '':
+                          registry = normalize_registry(obj.get('registry', 'docker.io'))
+                          full_image = f"{registry}/{repo}:{tag}"
+                          images.append(full_image)
+                  for k, v in obj.items():
+                      images.extend(find_images(v, path + [k]))
+              elif isinstance(obj, list):
+                  for item in obj:
+                      images.extend(find_images(item, path))
+              return images
+
+          with open(sys.argv[1]) as f:
+              values = yaml.safe_load(f)
+
+          found = sorted(set(find_images(values)))
+          # 过滤掉明显无效的（必须包含 : 且 tag 非空）
+          for img in found:
+              if ':' in img and not img.endswith(':'):
+                  print(img)
+          PYEOF
+
+          python3 /tmp/extract_images.py work/chart-values.yaml | tee work/image-list.txt
+
+          IMG_COUNT=$(wc -l < work/image-list.txt)
+          echo ""
+          echo "  共发现 ${IMG_COUNT} 个镜像:"
+          cat work/image-list.txt | sed 's/^/    /'
+          if [ "$IMG_COUNT" -eq 0 ]; then
+            echo "❌ 错误：未提取到任何镜像，请检查 chart values"
+            exit 1
+          fi
+
+      # ─────────────────────────────────────
+      # 步骤 6: 拉取并保存镜像
+      # ─────────────────────────────────────
+      - name: 拉取并保存镜像
+        run: |
+          set -euo pipefail
+
+          echo "=== [3/5] 拉取并保存容器镜像 ==="
+          mkdir -p work/images
+
+          # 清空旧 manifest
+          > work/images/manifest.jsonl
+
+          PULLED=0
+          FAILED=0
+
+          while IFS= read -r image; do
+            [ -z "$image" ] && continue
+            echo ""
+            echo "  ── 处理镜像: $image"
+
+            # 拉取目标架构镜像（amd64 或 arm64，由 matrix 决定）
+            if ! docker pull --platform ${{ matrix.docker_platform }} "$image" 2>&1 | tail -3 | sed 's/^/    /'; then
+              echo "    ❌ 拉取失败，跳过: $image"
+              FAILED=$((FAILED + 1))
+              continue
+            fi
+
+            # 生成安全文件名（/ 和 : 替换为 -）
+            TAR_NAME=$(echo "$image" | sed 's|[/:]|-|g').tar
+
+            # 保存为 tar
+            docker save "$image" -o "work/images/${TAR_NAME}" 2>/dev/null \
+              || { echo "    ❌ 保存失败: $image"; FAILED=$((FAILED + 1)); continue; }
+
+            SIZE=$(du -h "work/images/${TAR_NAME}" | cut -f1)
+            echo "    ✓ 保存完成: ${TAR_NAME} (${SIZE})"
+
+            # ── 计算 Harbor 目标路径 ──────────────────────
+            # 规则: docker.io/bitnami/redis:7.x       → library/redis:7.x
+            #       docker.io/bitnami/redis-sentinel:x → library/redis-sentinel:x
+            #       docker.io/bitnami/redis-exporter:x → library/redis-exporter:x
+            #       docker.io/bitnami/os-shell:x       → library/os-shell:x
+            # 仅保留镜像名（去掉 registry 和组织前缀），放入 library/ 项目
+            TAG=$(echo "$image" | awk -F: '{print $NF}')
+            IMAGE_PATH=$(echo "$image" | awk -F: '{print $1}')          # docker.io/bitnami/xxx
+            IMAGE_NAME=$(echo "$IMAGE_PATH" | awk -F/ '{print $NF}')    # xxx
+            HARBOR_PATH="library/${IMAGE_NAME}:${TAG}"
+
+            # 写入 manifest（JSON Lines 格式）
+            printf '{"source":"%s","tar":"%s","harbor_path":"%s"}\n' \
+              "$image" "$TAR_NAME" "$HARBOR_PATH" \
+              >> work/images/manifest.jsonl
+
+            PULLED=$((PULLED + 1))
+          done < work/image-list.txt
+
+          echo ""
+          echo "=== 镜像保存统计: ${PULLED} 成功, ${FAILED} 失败 ==="
+          if [ "$PULLED" -eq 0 ]; then
+            echo "❌ 错误：未成功拉取任何镜像"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== 镜像文件列表 ==="
+          ls -lh work/images/
+          echo ""
+          echo "=== 镜像 Manifest ==="
+          cat work/images/manifest.jsonl
+
+      # ─────────────────────────────────────
+      # 步骤 7: 生成 values-offline.yaml 模板
+      # ─────────────────────────────────────
+      - name: 生成 values-offline.yaml 模板
+        run: |
+          set -euo pipefail
+
+          echo "=== [4/5] 生成离线安装 values 模板 ==="
+
+          cat > /tmp/gen_values_tpl.py << 'PYEOF'
+          import yaml, sys, json, copy
+
+          # ─── 读取 chart values ───────────────────────────
+          with open('work/chart-values.yaml') as f:
+              values = yaml.safe_load(f)
+
+          # ─── 读取镜像 manifest，构建源镜像→Harbor 路径映射 ───
+          image_map = {}  # source_image → {'registry':'HARBOR_ADDR','repo':'library/xxx','tag':'yyy'}
+          with open('work/images/manifest.jsonl') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  entry = json.loads(line)
+                  src = entry['source']
+                  harbor_path = entry['harbor_path']          # library/redis:7.x
+                  harbor_repo, harbor_tag = harbor_path.rsplit(':', 1)
+                  image_map[src] = {'repo': harbor_repo, 'tag': harbor_tag}
+
+          def normalize_registry(r):
+              return 'docker.io' if (not r or r == 'docker.io') else r
+
+          def patch_images(obj, image_map):
+              """递归替换 values 中的 registry/repository/tag 为 Harbor 地址"""
+              if isinstance(obj, dict):
+                  repo = obj.get('repository', '')
+                  tag = obj.get('tag', '')
+                  if repo and tag and isinstance(repo, str) and isinstance(tag, (str, int)):
+                      registry = normalize_registry(obj.get('registry', 'docker.io'))
+                      full_image = f"{registry}/{repo}:{tag}"
+                      if full_image in image_map:
+                          obj['registry'] = 'HARBOR_ADDR'
+                          obj['repository'] = image_map[full_image]['repo']
+                          obj['tag'] = image_map[full_image]['tag']
+                  for k, v in obj.items():
+                      patch_images(v, image_map)
+              elif isinstance(obj, list):
+                  for item in obj:
+                      patch_images(item, image_map)
+
+          patched = copy.deepcopy(values)
+          patch_images(patched, image_map)
+
+          with open('work/values-offline.yaml.tpl', 'w') as f:
+              f.write("# Redis 离线安装 values 模板\n")
+              f.write("# 安装脚本会自动将 HARBOR_ADDR 替换为实际的 Harbor 地址\n")
+              f.write("# 手动使用: sed 's|HARBOR_ADDR|harbor.example.com|g' values-offline.yaml.tpl > values.yaml\n")
+              f.write("#\n")
+              yaml.dump(patched, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+          print(f"✓ values-offline.yaml.tpl 已生成，共替换 {len(image_map)} 个镜像")
+          PYEOF
+
+          python3 /tmp/gen_values_tpl.py
+
+          echo ""
+          echo "=== values-offline.yaml.tpl 预览（含 image 字段的前80行）==="
+          grep -A3 'registry:\|repository:\|tag:' work/values-offline.yaml.tpl | head -80 || true
+
+      # ─────────────────────────────────────
+      # 步骤 8: 下载 Helm 二进制（内嵌到包中）
+      # ─────────────────────────────────────
+      - name: 下载 Helm 二进制（内嵌到离线包）
+        run: |
+          set -euo pipefail
+
+          echo "=== 下载 Helm 二进制 (${HELM_VERSION}, 目标架构: ${{ matrix.arch }}) ==="
+          # 内嵌到离线包中的 helm 必须与目标节点架构一致
+          wget -q -O work/helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-${{ matrix.arch }}.tar.gz" \
+            || { echo "❌ Helm 下载失败"; exit 1; }
+          tar -xzf work/helm.tar.gz -C work/
+          mv "work/linux-${{ matrix.arch }}/helm" work/helm
+          chmod +x work/helm
+          rm -rf "work/linux-${{ matrix.arch }}" work/helm.tar.gz
+          # 注意: arm64 的 helm 无法在 amd64 CI 上直接执行，仅验证文件存在
+          echo "✓ Helm 二进制已下载 ($(du -h work/helm | cut -f1))"
+
+      # ─────────────────────────────────────
+      # 步骤 9: 打包离线包
+      # ─────────────────────────────────────
+      - name: 打包离线包
+        run: |
+          set -euo pipefail
+
+          echo "=== [5/5] 打包离线安装包 ==="
+
+          TEMP_PKG_DIR="$(mktemp -d)"
+          trap "rm -rf $TEMP_PKG_DIR" EXIT
+
+          # ── 目录结构 ─────────────────────────────────────
+          # redis-offline-23.1.1-vXXX/
+          #   charts/                    ← Helm chart tgz（自包含 + 依赖 chart）
+          #   images/                    ← 容器镜像 tar + manifest.jsonl
+          #   install.sh                 ← 一键安装
+          #   load-images.sh             ← 镜像导入/推送
+          #   cleanup.sh                 ← 卸载
+          #   helm                       ← Helm 二进制（免安装）
+          #   values-offline.yaml.tpl    ← 离线 values 模板
+          #   README.txt
+          # ─────────────────────────────────────────────────
+
+          mkdir -p "$TEMP_PKG_DIR"/{charts,images}
+
+          # 复制 chart 文件
+          cp work/charts_output/*.tgz "$TEMP_PKG_DIR/charts/"
+          echo "  ✓ charts/ ($(ls work/charts_output/*.tgz | wc -l) 个文件)"
+
+          # 复制镜像文件
+          IMAGE_TAR_COUNT=$(find work/images -name "*.tar" | wc -l)
+          if [ "$IMAGE_TAR_COUNT" -eq 0 ]; then
+            echo "❌ 错误：images 目录中无 tar 文件，终止打包"
+            exit 1
+          fi
+          cp work/images/*.tar "$TEMP_PKG_DIR/images/"
+          cp work/images/manifest.jsonl "$TEMP_PKG_DIR/images/"
+          echo "  ✓ images/ (${IMAGE_TAR_COUNT} 个镜像 tar)"
+
+          # 复制 values 模板
+          cp work/values-offline.yaml.tpl "$TEMP_PKG_DIR/"
+          echo "  ✓ values-offline.yaml.tpl"
+
+          # 复制 Helm 二进制
+          cp work/helm "$TEMP_PKG_DIR/"
+          echo "  ✓ helm 二进制"
+
+          # 复制安装脚本（来自 redis/install/）
+          INSTALL_DIR="${GITHUB_WORKSPACE}/redis/install"
+          for script in install.sh load-images.sh cleanup.sh; do
+            if [ -f "${INSTALL_DIR}/${script}" ]; then
+              cp "${INSTALL_DIR}/${script}" "$TEMP_PKG_DIR/"
+              chmod +x "$TEMP_PKG_DIR/${script}"
+              echo "  ✓ ${script}"
+            else
+              echo "  ⚠️  未找到脚本: ${INSTALL_DIR}/${script}"
+            fi
+          done
+
+          # 复制 values 目录（如果有自定义 values）
+          if [ -d "${GITHUB_WORKSPACE}/redis/values" ] && \
+             ls "${GITHUB_WORKSPACE}/redis/values"/*.yaml &>/dev/null 2>&1; then
+            cp -r "${GITHUB_WORKSPACE}/redis/values" "$TEMP_PKG_DIR/"
+            echo "  ✓ values/ 自定义目录"
+          fi
+
+          # 预先生成镜像清单文本
+          IMAGE_LIST_TEXT=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            SRC=$(python3 -c "import sys,json;d=json.loads(sys.argv[1]);print(d['source'])" "$line" 2>/dev/null) || continue
+            HP=$(python3 -c "import sys,json;d=json.loads(sys.argv[1]);print(d['harbor_path'])" "$line" 2>/dev/null) || continue
+            IMAGE_LIST_TEXT="${IMAGE_LIST_TEXT}  ${SRC}\n    -> <harbor-addr>/${HP}\n"
+          done < work/images/manifest.jsonl
+
+          # 写 README
+          {
+            echo "Redis 离线安装包"
+            echo "================"
+            echo "Chart:      bitnami/redis ${CHART_VERSION}"
+            echo "构建时间:   $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            echo "构建版本:   ${TAG_VERSION}"
+            echo "架构:       ${{ matrix.arch }}"
+            echo ""
+            echo "目录结构"
+            echo "--------"
+            echo "charts/"
+            echo "  redis-${CHART_VERSION}.tgz   (自包含 Helm chart，含 common 依赖)"
+            echo "  common-x.x.x.tgz             (bitnami/common 依赖 chart)"
+            echo ""
+            echo "images/"
+            echo "  *.tar              (所有容器镜像 tar 包)"
+            echo "  manifest.jsonl     (镜像清单，源镜像 -> Harbor 路径映射)"
+            echo ""
+            echo "install.sh           一键安装脚本"
+            echo "load-images.sh       镜像导入/推送脚本"
+            echo "cleanup.sh           卸载脚本"
+            echo "helm                 Helm 二进制（免安装，直接使用）"
+            echo "values-offline.yaml.tpl  离线 values 模板（HARBOR_ADDR 占位符）"
+            echo ""
+            echo "快速安装"
+            echo "--------"
+            echo "sudo ./install.sh <harbor-addr> [chart-repo-addr] [namespace] [release-name]"
+            echo ""
+            echo "示例: sudo ./install.sh harbor.example.com harbor.example.com redis my-redis"
+            echo ""
+            echo "分步操作"
+            echo "--------"
+            echo "./load-images.sh harbor.example.com [user] [password]"
+            echo ""
+            echo "# 本地 chart tgz 直接安装:"
+            echo "sed 's|HARBOR_ADDR|harbor.example.com|g' values-offline.yaml.tpl > /tmp/values.yaml"
+            echo "./helm install redis ./charts/redis-${CHART_VERSION}.tgz \\"
+            echo "  -n redis --create-namespace -f /tmp/values.yaml"
+            echo ""
+            echo "# 卸载: ./cleanup.sh [namespace] [release-name]"
+            echo ""
+            echo "镜像清单（Harbor 推送目标）"
+            echo "--------------------------"
+            echo -e "$IMAGE_LIST_TEXT"
+          } > "$TEMP_PKG_DIR/README.txt"
+
+          # 写 meta 信息
+          mkdir -p "$TEMP_PKG_DIR/meta"
+          {
+            echo "chart_name=${CHART_NAME}"
+            echo "chart_version=${CHART_VERSION}"
+            echo "helm_version=${HELM_VERSION}"
+            echo "arch=${{ matrix.arch }}"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "tag=${TAG_VERSION}"
+          } > "$TEMP_PKG_DIR/meta/version.txt"
+
+          # 打包
+          tar -czf "${PACKAGE_NAME}" -C "$TEMP_PKG_DIR" .
+          echo ""
+          echo "✓ 离线包已创建: ${PACKAGE_NAME}"
+          echo "  大小: $(du -h "${PACKAGE_NAME}" | cut -f1)"
+          echo ""
+          echo "=== 包内容预览 ==="
+          tar -tzf "${PACKAGE_NAME}" | head -30
+
+      # ─────────────────────────────────────
+      # 步骤 10: 生成校验和
+      # ─────────────────────────────────────
+      - name: 生成校验和
+        run: |
+          sha256sum "${PACKAGE_NAME}" > "${PACKAGE_NAME}.sha256sum.txt"
+          echo "✓ 校验和: $(cat "${PACKAGE_NAME}.sha256sum.txt")"
+
+      # ─────────────────────────────────────
+      # 步骤 11: 上传到 GitHub Release
+      # ─────────────────────────────────────
+      - name: 上传到 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set_env.outputs.tag_version }}
+          name: "Redis 离线包 ${{ steps.set_env.outputs.tag_version }}"
+          body: |
+            ## Redis 离线安装包
+
+            - **Chart**: bitnami/redis `${{ env.CHART_VERSION }}`
+            - **架构**: `${{ matrix.arch }}`
+            - **构建时间**: ${{ github.event.head_commit.timestamp }}
+
+            ### 包含内容
+            - 所有容器镜像（离线 tar 包）
+              - `bitnami/redis` - 主节点 / 副本节点镜像
+              - `bitnami/redis-sentinel` - Sentinel 高可用镜像
+              - `bitnami/redis-exporter` - Prometheus 监控指标导出镜像
+              - `bitnami/os-shell` - 卷权限初始化镜像
+            - 自包含 Helm chart（含 bitnami/common 依赖）
+            - 一键安装脚本
+            - 镜像推送脚本
+            - Helm 二进制
+
+            ### 快速安装
+            ```bash
+            tar -xzf redis-offline-${{ env.CHART_VERSION }}-*.tar.gz
+            sudo ./install.sh <harbor-addr> [chart-repo-addr] [namespace] [release-name]
+            ```
+          files: |
+            redis-offline-*.tar.gz
+            redis-offline-*.sha256sum.txt
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
