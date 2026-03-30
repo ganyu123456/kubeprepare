@@ -153,6 +153,21 @@ jobs:
           # 解压到 chart_src 目录
           tar -xzf "work/${CHART_NAME}-${CHART_VERSION}.tgz" -C work/chart_src/
 
+          # ── 关键修复：将 Chart.yaml 中的 OCI 依赖源替换为传统 HTTP Helm Repo ──
+          # bitnami/redis Chart.yaml 声明依赖时使用 oci://registry-1.docker.io/bitnamicharts
+          # 但 bitnami/common 等子 chart 通过 OCI 方式拉取不稳定，改用 HTTP repo 更可靠
+          CHART_YAML="work/chart_src/${CHART_NAME}/Chart.yaml"
+          if grep -q "oci://registry-1.docker.io/bitnamicharts" "$CHART_YAML" 2>/dev/null; then
+            sed -i 's|repository: oci://registry-1.docker.io/bitnamicharts|repository: https://charts.bitnami.com/bitnami|g' \
+              "$CHART_YAML"
+            echo "  ✓ Chart.yaml 依赖源已从 OCI 替换为 Bitnami HTTP Repo"
+          fi
+
+          # 确保 bitnami helm repo 已添加（供 dependency update 使用）
+          helm repo add bitnami https://charts.bitnami.com/bitnami --force-update 2>/dev/null || true
+          helm repo update bitnami 2>/dev/null || true
+          echo "  ✓ bitnami helm repo 已就绪"
+
           # 下载依赖（bitnami/common 等），内嵌到 charts/ 子目录
           echo "  执行 helm dependency update..."
           helm dependency update "work/chart_src/${CHART_NAME}/" 2>&1 | sed 's/^/  /'
