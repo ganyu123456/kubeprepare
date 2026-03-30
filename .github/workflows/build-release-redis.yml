@@ -163,63 +163,63 @@ jobs:
 
           # 将下载脚本写入文件（'PYEOF' 防止 shell 提前展开 $ 变量）
           cat > /tmp/download_deps.py << 'PYEOF'
-import yaml, subprocess, sys, os
+          import yaml, subprocess, sys, os
 
-chart_dir = sys.argv[1]
-charts_sub = os.path.join(chart_dir, "charts")
-os.makedirs(charts_sub, exist_ok=True)
+          chart_dir = sys.argv[1]
+          charts_sub = os.path.join(chart_dir, "charts")
+          os.makedirs(charts_sub, exist_ok=True)
 
-with open(os.path.join(chart_dir, "Chart.yaml")) as f:
-    chart = yaml.safe_load(f)
+          with open(os.path.join(chart_dir, "Chart.yaml")) as f:
+              chart = yaml.safe_load(f)
 
-deps = chart.get("dependencies", [])
-print(f"  共 {len(deps)} 个依赖需要下载")
+          deps = chart.get("dependencies", [])
+          print(f"  共 {len(deps)} 个依赖需要下载")
 
-failed = []
-for dep in deps:
-    name = dep["name"]
-    version = str(dep.get("version", ""))
-    print(f"  ── 下载依赖: {name}  version={version}")
+          failed = []
+          for dep in deps:
+              name = dep["name"]
+              version = str(dep.get("version", ""))
+              print(f"  ── 下载依赖: {name}  version={version}")
 
-    # 方式1: 直接 OCI helm pull（精确版本，绕过 dependency update 的解析 bug）
-    r = subprocess.run(
-        ["helm", "pull",
-         f"oci://registry-1.docker.io/bitnamicharts/{name}",
-         "--version", version, "-d", charts_sub],
-        capture_output=True, text=True
-    )
-    if r.returncode == 0:
-        print(f"    ✓ OCI 直接拉取成功")
-        continue
+              # 方式1: 直接 OCI helm pull（精确版本，绕过 dependency update 的解析 bug）
+              r = subprocess.run(
+                  ["helm", "pull",
+                   f"oci://registry-1.docker.io/bitnamicharts/{name}",
+                   "--version", version, "-d", charts_sub],
+                  capture_output=True, text=True
+              )
+              if r.returncode == 0:
+                  print(f"    ✓ OCI 直接拉取成功")
+                  continue
 
-    print(f"    OCI 失败: {r.stderr.strip()[:200]}")
+              print(f"    OCI 失败: {r.stderr.strip()[:200]}")
 
-    # 方式2: 回退到 bitnami HTTP repo（适用于旧版本 common）
-    subprocess.run(
-        ["helm", "repo", "add", "bitnami",
-         "https://charts.bitnami.com/bitnami", "--force-update"],
-        capture_output=True
-    )
-    subprocess.run(["helm", "repo", "update", "bitnami"], capture_output=True)
-    r2 = subprocess.run(
-        ["helm", "pull", f"bitnami/{name}",
-         "--version", version, "-d", charts_sub],
-        capture_output=True, text=True
-    )
-    if r2.returncode == 0:
-        print(f"    ✓ HTTP repo 拉取成功")
-        continue
+              # 方式2: 回退到 bitnami HTTP repo（适用于旧版本 common）
+              subprocess.run(
+                  ["helm", "repo", "add", "bitnami",
+                   "https://charts.bitnami.com/bitnami", "--force-update"],
+                  capture_output=True
+              )
+              subprocess.run(["helm", "repo", "update", "bitnami"], capture_output=True)
+              r2 = subprocess.run(
+                  ["helm", "pull", f"bitnami/{name}",
+                   "--version", version, "-d", charts_sub],
+                  capture_output=True, text=True
+              )
+              if r2.returncode == 0:
+                  print(f"    ✓ HTTP repo 拉取成功")
+                  continue
 
-    print(f"    ❌ 所有方式均失败: {name}:{version}")
-    print(f"       {r2.stderr.strip()[:200]}")
-    failed.append(f"{name}:{version}")
+              print(f"    ❌ 所有方式均失败: {name}:{version}")
+              print(f"       {r2.stderr.strip()[:200]}")
+              failed.append(f"{name}:{version}")
 
-if failed:
-    print(f"❌ 依赖下载失败: {failed}")
-    sys.exit(1)
+          if failed:
+              print(f"❌ 依赖下载失败: {failed}")
+              sys.exit(1)
 
-print("  ✓ 所有依赖下载完成")
-PYEOF
+          print("  ✓ 所有依赖下载完成")
+          PYEOF
 
           python3 /tmp/download_deps.py "work/chart_src/${CHART_NAME}"
 
