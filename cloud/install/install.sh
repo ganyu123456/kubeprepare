@@ -701,7 +701,7 @@ else
 fi
 
 # 步骤8: 安装KubeEdge CloudCore
-echo "[8/10] 安装KubeEdge CloudCore..." | tee -a "$INSTALL_LOG"
+echo "[8/11] 安装KubeEdge CloudCore..." | tee -a "$INSTALL_LOG"
 cp "$KEADM_BIN" /usr/local/bin/keadm
 chmod +x /usr/local/bin/keadm
 
@@ -721,7 +721,7 @@ for i in {1..30}; do
 done
 
 # 步骤9: 启用CloudCore附加功能
-echo "[9/10] 启用CloudCore附加功能..." | tee -a "$INSTALL_LOG"
+echo "[9/11] 启用CloudCore附加功能..." | tee -a "$INSTALL_LOG"
 CLOUDCORE_CONFIG=$($KUBECTL -n kubeedge get cm cloudcore -o jsonpath='{.data.cloudcore\.yaml}' 2>/dev/null || echo "")
 
 if [ -z "$CLOUDCORE_CONFIG" ]; then
@@ -779,8 +779,137 @@ EOF_PATCH
   rm -f /tmp/cloudcore-patch.yaml
 fi
 
-# 步骤10: 生成edge token
-echo "[10/10] 生成edge token..." | tee -a "$INSTALL_LOG"
+# 步骤10: 部署 KubeEdge Controller Manager
+echo "[10/11] 部署 KubeEdge Controller Manager..." | tee -a "$INSTALL_LOG"
+
+cat > /tmp/kubeedge-controller-manager.yaml << EOF
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeedge-controller-manager
+  namespace: kubeedge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeedge-controller-manager
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "configmaps", "secrets", "services",
+                "endpoints", "namespaces", "serviceaccounts", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "replicasets", "statefulsets",
+                "deployments/status", "daemonsets/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps.kubeedge.io"]
+    resources: ["edgeapplications", "edgeapplications/status",
+                "nodegroups", "nodegroups/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeedge-controller-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeedge-controller-manager
+subjects:
+  - kind: ServiceAccount
+    name: kubeedge-controller-manager
+    namespace: kubeedge
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeedge-controller-manager
+  namespace: kubeedge
+  labels:
+    kubeedge: controller-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      kubeedge: controller-manager
+  template:
+    metadata:
+      labels:
+        kubeedge: controller-manager
+    spec:
+      serviceAccountName: kubeedge-controller-manager
+      hostNetwork: true
+      containers:
+        - name: controller-manager
+          image: kubeedge/controller-manager:v${KUBEEDGE_VERSION}
+          imagePullPolicy: IfNotPresent
+          command:
+            - controller-manager
+          args:
+            - --leader-elect=false
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/master
+                    operator: Exists
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+EOF
+
+if $KUBECTL apply -f /tmp/kubeedge-controller-manager.yaml >> "$INSTALL_LOG" 2>&1; then
+  echo "  ✓ Controller Manager 资源已创建" | tee -a "$INSTALL_LOG"
+else
+  echo "  ⚠️  Controller Manager 部署失败，请查看日志: $INSTALL_LOG" | tee -a "$INSTALL_LOG"
+fi
+rm -f /tmp/kubeedge-controller-manager.yaml
+
+echo "  等待 Controller Manager Pod 就绪（最多 60s）..." | tee -a "$INSTALL_LOG"
+for i in $(seq 1 30); do
+  if $KUBECTL -n kubeedge get pod -l kubeedge=controller-manager 2>/dev/null | grep -q Running; then
+    echo "  ✓ Controller Manager Pod 已就绪" | tee -a "$INSTALL_LOG"
+    break
+  fi
+  if [ "$i" -eq 30 ]; then
+    echo "  ⚠️  等待超时，请手动检查: kubectl get pods -n kubeedge" | tee -a "$INSTALL_LOG"
+  fi
+  sleep 2
+done
+
+# 步骤11: 生成edge token
+echo "[11/11] 生成edge token..." | tee -a "$INSTALL_LOG"
 TOKEN_DIR="/etc/kubeedge/tokens"
 mkdir -p "$TOKEN_DIR"
 

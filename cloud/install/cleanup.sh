@@ -56,6 +56,36 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 1
 fi
 
+# 0. 优雅删除 K8s 资源（K3s API 仍可用时）
+echo "[0/12] 优雅删除 KubeEdge K8s 资源..."
+KUBECTL_BIN=""
+if command -v kubectl &>/dev/null; then
+  KUBECTL_BIN="kubectl"
+elif [ -f /usr/local/bin/k3s ]; then
+  KUBECTL_BIN="/usr/local/bin/k3s kubectl"
+fi
+
+if [ -n "$KUBECTL_BIN" ] && $KUBECTL_BIN cluster-info &>/dev/null 2>&1; then
+  echo "  Kubernetes API 可访问，开始优雅删除资源..."
+
+  # 删除 controller-manager
+  $KUBECTL_BIN delete deployment kubeedge-controller-manager -n kubeedge --timeout=30s 2>/dev/null && \
+    echo "  ✓ Deployment/kubeedge-controller-manager 已删除" || true
+  $KUBECTL_BIN delete clusterrolebinding kubeedge-controller-manager --timeout=10s 2>/dev/null && \
+    echo "  ✓ ClusterRoleBinding/kubeedge-controller-manager 已删除" || true
+  $KUBECTL_BIN delete clusterrole kubeedge-controller-manager --timeout=10s 2>/dev/null && \
+    echo "  ✓ ClusterRole/kubeedge-controller-manager 已删除" || true
+  $KUBECTL_BIN delete serviceaccount kubeedge-controller-manager -n kubeedge --timeout=10s 2>/dev/null && \
+    echo "  ✓ ServiceAccount/kubeedge-controller-manager 已删除" || true
+
+  # 删除 EdgeMesh（如果存在）
+  $KUBECTL_BIN delete deployment,daemonset -n kubeedge -l app.kubernetes.io/name=edgemesh --timeout=30s 2>/dev/null || true
+
+  echo "  ✓ K8s 资源优雅删除完成"
+else
+  echo "  ⚠️  K3s API 不可访问，跳过优雅删除（K8s 数据将随 K3s 一起清理）"
+fi
+
 # 1. 停止所有相关服务
 echo "[1/12] 停止所有相关服务..."
 for service in k3s k3s-agent cloudcore; do
@@ -79,6 +109,7 @@ done
 echo "[3/12] 强制停止所有相关进程..."
 pkill -9 k3s 2>/dev/null || true
 pkill -9 cloudcore 2>/dev/null || true
+pkill -9 controller-manager 2>/dev/null || true
 pkill -9 containerd 2>/dev/null || true
 pkill -9 containerd-shim 2>/dev/null || true
 pkill -9 flanneld 2>/dev/null || true
@@ -123,13 +154,14 @@ for dir in /var/lib/rancher/k3s /etc/rancher /run/k3s /var/lib/kubelet /var/lib/
 done
 echo "  ✓ K3s 数据目录已删除"
 
-# 7. 清理 CloudCore
-echo "[7/12] 清理 CloudCore 组件..."
-if command -v cloudcore &> /dev/null || [ -f /usr/local/bin/cloudcore ]; then
-  rm -f /usr/local/bin/cloudcore
-  rm -f /usr/local/bin/keadm
-  echo "  - CloudCore 二进制文件已删除"
-fi
+# 7. 清理 CloudCore 和 Controller Manager
+echo "[7/12] 清理 CloudCore 和 Controller Manager 组件..."
+for binary in cloudcore keadm controller-manager; do
+  if [ -f "/usr/local/bin/$binary" ]; then
+    rm -f "/usr/local/bin/$binary"
+    echo "  - 已删除: /usr/local/bin/$binary"
+  fi
+done
 
 for dir in /etc/kubeedge /var/lib/kubeedge /var/log/kubeedge; do
   if [ -d "$dir" ]; then
@@ -137,7 +169,7 @@ for dir in /etc/kubeedge /var/lib/kubeedge /var/log/kubeedge; do
     echo "  - 已删除: $dir"
   fi
 done
-echo "  ✓ CloudCore 已清理"
+echo "  ✓ CloudCore 和 Controller Manager 已清理"
 
 # 8. 清理网络接口
 echo "[8/12] 清理网络接口..."
@@ -198,6 +230,7 @@ echo ""
 echo "已清理的组件："
 [ "$HAS_K3S" = true ] && echo "  ✓ K3s (包括 master/worker)"
 [ "$HAS_CLOUDCORE" = true ] && echo "  ✓ CloudCore"
+[ "$HAS_CLOUDCORE" = true ] && echo "  ✓ Controller Manager (kubeedge-controller-manager)"
 [ "$HAS_DOCKER" = true ] && echo "  ⓘ Docker 未被清理（如需清理请手动执行）"
 echo ""
 echo "清理完成的项目："
