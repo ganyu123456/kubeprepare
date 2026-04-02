@@ -193,7 +193,13 @@ rm -f /etc/systemd/system/k3s.service
 
 cp "$K3S_BIN" /usr/local/bin/k3s
 chmod +x /usr/local/bin/k3s
+ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
 echo "✓ k3s 二进制文件已安装: $(k3s --version 2>/dev/null | head -1)" | tee -a "$INSTALL_LOG"
+echo "✓ kubectl 软链接已创建 -> /usr/local/bin/k3s" | tee -a "$INSTALL_LOG"
+
+# 创建 kubectl 软链接，方便直接使用 kubectl 命令
+ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+echo "✓ kubectl 软链接已创建 -> /usr/local/bin/k3s" | tee -a "$INSTALL_LOG"
 
 # =====================================
 # 步骤 3: 配置 k3s server systemd 服务
@@ -356,6 +362,37 @@ else
 fi
 
 # =====================================
+# 配置 kubectl 环境
+# =====================================
+echo "配置 kubectl 环境变量..." | tee -a "$INSTALL_LOG"
+
+# 等待 kubeconfig 生成（加入节点后 k3s 会在本地生成 kubeconfig）
+for i in $(seq 1 30); do
+  if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+    echo "✓ kubeconfig 已就绪: /etc/rancher/k3s/k3s.yaml" | tee -a "$INSTALL_LOG"
+    break
+  fi
+  [ "$i" -eq 30 ] && echo "⚠️  kubeconfig 未找到，KUBECONFIG 仍会写入，就绪后自动生效" | tee -a "$INSTALL_LOG"
+  sleep 2
+done
+
+# 写入全局 profile，所有用户登录后均可直接使用 kubectl
+cat > /etc/profile.d/k3s-kubectl.sh << 'PROFILE_EOF'
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+PROFILE_EOF
+chmod +x /etc/profile.d/k3s-kubectl.sh
+
+# 同步写入 root 的 .bashrc（sudo -i / su - 也能生效）
+if ! grep -q "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" /root/.bashrc 2>/dev/null; then
+  echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> /root/.bashrc
+fi
+
+# 当前 shell 立即生效
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+echo "✓ KUBECONFIG 已配置，重新登录后 kubectl 可直接使用" | tee -a "$INSTALL_LOG"
+
+# =====================================
 # 安装完成
 # =====================================
 echo "" | tee -a "$INSTALL_LOG"
@@ -373,6 +410,12 @@ echo "3. 在任意控制节点验证新节点已加入（ROLES 应为 control-pl
 echo "   kubectl get nodes" | tee -a "$INSTALL_LOG"
 echo "4. 验证 etcd 成员列表（在任意控制节点执行）:" | tee -a "$INSTALL_LOG"
 echo "   k3s etcd-snapshot ls 2>/dev/null || kubectl get endpoints -n kube-system" | tee -a "$INSTALL_LOG"
+echo "" | tee -a "$INSTALL_LOG"
+echo "=== kubectl 使用说明 ===" | tee -a "$INSTALL_LOG"
+echo "  本节点已创建 kubectl 软链接并配置 KUBECONFIG，可直接使用以下命令：" | tee -a "$INSTALL_LOG"
+echo "  kubectl get nodes        # 查看所有节点" | tee -a "$INSTALL_LOG"
+echo "  kubectl get pods -A      # 查看所有 Pod" | tee -a "$INSTALL_LOG"
+echo "  注意：若当前 shell 不识别，执行 source /etc/profile.d/k3s-kubectl.sh 或重新登录" | tee -a "$INSTALL_LOG"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a "$INSTALL_LOG"
 echo "" | tee -a "$INSTALL_LOG"
 echo "安装日志: $INSTALL_LOG" | tee -a "$INSTALL_LOG"

@@ -356,7 +356,8 @@ install_k3s_worker() {
   if [ -f "$k3s_bin" ]; then
     cp "$k3s_bin" /usr/local/bin/k3s
     chmod +x /usr/local/bin/k3s
-    echo "✓ k3s二进制文件已安装" | tee -a "$INSTALL_LOG"
+    ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+    echo "✓ k3s二进制文件已安装，kubectl 软链接已创建" | tee -a "$INSTALL_LOG"
   else
     echo "✗ 找不到k3s二进制文件: $k3s_bin" | tee -a "$INSTALL_LOG"
     return 1
@@ -578,6 +579,13 @@ echo "✓ 先决条件检查通过" | tee -a "$INSTALL_LOG"
 echo "[3/10] 安装k3s..." | tee -a "$INSTALL_LOG"
 cp "$K3S_BIN" /usr/local/bin/k3s
 chmod +x /usr/local/bin/k3s
+ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+echo "  ✓ kubectl 软链接已创建 -> /usr/local/bin/k3s" | tee -a "$INSTALL_LOG"
+
+# 配置 KUBECONFIG 让 kubectl 自动识别
+echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" > /etc/profile.d/k3s-kubectl.sh
+chmod +x /etc/profile.d/k3s-kubectl.sh
+echo "  ✓ KUBECONFIG 已写入 /etc/profile.d/k3s-kubectl.sh（新 shell 自动生效）" | tee -a "$INSTALL_LOG"
 
 # 创建k3s服务
 cat > /etc/systemd/system/k3s.service << EOF
@@ -833,6 +841,39 @@ subjects:
     name: kubeedge-controller-manager
     namespace: kubeedge
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeedge-controller-manager-node-task
+  labels:
+    kubeedge: controller-manager
+rules:
+  - apiGroups: ["operations.kubeedge.io"]
+    resources:
+      - nodeupgradejobs
+      - imageprepulljobs
+      - configupdatejobs
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["operations.kubeedge.io"]
+    resources:
+      - nodeupgradejobs/status
+      - imageprepulljobs/status
+      - configupdatejobs/status
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeedge-controller-manager-node-task
+subjects:
+  - kind: ServiceAccount
+    name: kubeedge-controller-manager
+    namespace: kubeedge
+roleRef:
+  kind: ClusterRole
+  name: kubeedge-controller-manager-node-task
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -857,9 +898,7 @@ spec:
           image: kubeedge/controller-manager:v${KUBEEDGE_VERSION}
           imagePullPolicy: IfNotPresent
           command:
-            - controller-manager
-          args:
-            - --leader-elect=false
+            - /usr/local/bin/controllermanager
           env:
             - name: NAMESPACE
               valueFrom:
