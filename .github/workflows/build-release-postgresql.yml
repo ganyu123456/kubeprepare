@@ -549,7 +549,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.set_env.outputs.tag_version }}
-          name: "PostgreSQL 离线包 ${{ steps.set_env.outputs.tag_version }}"
           body: |
             ## PostgreSQL 离线安装包
 

@@ -65,6 +65,10 @@ jobs:
           echo "=== 构建 EdgeCore 离线包 (架构: ${{ matrix.arch }}) ==="
           echo "版本信息: KubeEdge ${KUBEEDGE_VERSION}, containerd ${CONTAINERD_VERSION}, runc ${RUNC_VERSION}"
 
+          # 使用独立构建目录，避免与工作区中的 edgecore/ 目录同名冲突
+          BUILD_DIR=$(mktemp -d)
+          cd "$BUILD_DIR"
+
           # 1. 下载 KubeEdge 边缘端包（edgecore 二进制）
           echo "[1/6] 下载 KubeEdge 边缘端包..."
           KUBEEDGE_URL="https://github.com/kubeedge/kubeedge/releases/download/v${KUBEEDGE_VERSION}/kubeedge-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}.tar.gz"
@@ -131,12 +135,14 @@ jobs:
           docker save "$PAUSE_IMAGE" -o "images/kubeedge-pause-3.6.tar"
           echo "✓ pause 镜像已保存"
 
-          # EdgeMesh Agent 镜像
+          # EdgeMesh Agent 镜像（可选，失败不中断构建）
           EDGEMESH_IMAGE="docker.io/kubeedge/edgemesh-agent:${EDGEMESH_VERSION}"
-          docker pull --platform ${{ matrix.dockerfile_platform }} "$EDGEMESH_IMAGE" \
-            || (echo "❌ edgemesh-agent 镜像拉取失败" && exit 1)
-          docker save "$EDGEMESH_IMAGE" -o "images/edgemesh-agent-${EDGEMESH_VERSION}.tar"
-          echo "✓ EdgeMesh Agent 镜像已保存"
+          if docker pull --platform ${{ matrix.dockerfile_platform }} "$EDGEMESH_IMAGE" 2>/dev/null; then
+            docker save "$EDGEMESH_IMAGE" -o "images/edgemesh-agent-${EDGEMESH_VERSION}.tar"
+            echo "✓ EdgeMesh Agent 镜像已保存"
+          else
+            echo "⚠️  edgemesh-agent:${EDGEMESH_VERSION} 镜像不存在，跳过（可选组件）"
+          fi
 
           # Mosquitto MQTT 镜像（与 CloudCore Helm Chart 版本一致）
           MQTT_IMAGE="eclipse-mosquitto:1.6.15"
@@ -166,7 +172,7 @@ jobs:
           mkdir -p nfs
           docker run --rm \
             --platform ${{ matrix.dockerfile_platform }} \
-            -v "$(pwd)/nfs:/debs" \
+            -v "${BUILD_DIR}/nfs:/debs" \
             ubuntu:22.04 bash -c "
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
@@ -198,7 +204,7 @@ jobs:
 
           PACKAGE_NAME="edgecore-v${KUBEEDGE_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
           TEMP_PKG_DIR="$(mktemp -d)"
-          trap "rm -rf $TEMP_PKG_DIR" EXIT
+          trap "rm -rf $TEMP_PKG_DIR $BUILD_DIR" EXIT
 
           cp edgecore keadm runc helm "$TEMP_PKG_DIR/"
           cp -r bin cni-bin images meta "$TEMP_PKG_DIR/"
@@ -247,6 +253,8 @@ jobs:
 
           tar -czf "$PACKAGE_NAME" -C "$TEMP_PKG_DIR" .
           echo "✓ 包已创建: $PACKAGE_NAME ($(du -h "$PACKAGE_NAME" | cut -f1))"
+          # 将包文件复制回 GITHUB_WORKSPACE（当前在 BUILD_DIR 中）
+          cp "$PACKAGE_NAME" "${GITHUB_WORKSPACE}/"
 
       - name: 生成校验和并准备发布
         run: |
@@ -263,7 +271,6 @@ jobs:
         with:
           tag_name: ${{ steps.set_env.outputs.tag_version }}
           files: release-${{ matrix.arch }}/*
-          generate_release_notes: true
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

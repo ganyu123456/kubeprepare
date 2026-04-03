@@ -251,7 +251,6 @@ jobs:
         with:
           tag_name: ${{ steps.set_env.outputs.tag_version }}
           files: release-${{ matrix.arch }}/*
-          generate_release_notes: true
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -240,7 +240,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.tag.outputs.tag_version }}
-          name: "NFS 离线包 ${{ steps.tag.outputs.tag_version }}"
           body: |
             ## NFS 离线安装包
 

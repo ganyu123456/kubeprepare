@@ -666,7 +666,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.set_env.outputs.tag_version }}
-          name: "Redis 离线包 ${{ steps.set_env.outputs.tag_version }}"
           body: |
             ## Redis 离线安装包
 
