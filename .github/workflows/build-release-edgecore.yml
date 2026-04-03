@@ -1,0 +1,269 @@
+name: 构建和发布 EdgeCore 边缘端离线包
+
+on:
+  push:
+    tags:
+      - 'v*'
+    paths:
+      - 'edgecore/**'
+      - '.github/workflows/build-release-edgecore.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-edgecore:
+    runs-on: ubuntu-latest
+    name: 构建并发布 EdgeCore 离线包 (${{ matrix.arch }})
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            dockerfile_platform: linux/amd64
+          - arch: arm64
+            dockerfile_platform: linux/arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 QEMU 支持
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.dockerfile_platform }}
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 设置环境变量
+        id: set_env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_VERSION="manual-edgecore-${GITHUB_SHA::7}"
+          else
+            TAG_VERSION=${GITHUB_REF#refs/tags/}
+            if [ -z "$TAG_VERSION" ]; then
+              echo "error: 未能解析到 tag" >&2
+              exit 1
+            fi
+          fi
+          echo "TAG_VERSION=${TAG_VERSION}"         >> $GITHUB_ENV
+          echo "tag_version=${TAG_VERSION}"         >> $GITHUB_OUTPUT
+          echo "KUBEEDGE_VERSION=1.22.0"            >> $GITHUB_ENV
+          echo "CONTAINERD_VERSION=2.2.0"           >> $GITHUB_ENV
+          echo "RUNC_VERSION=1.4.0"                 >> $GITHUB_ENV
+          echo "CNI_VERSION=1.8.0"                  >> $GITHUB_ENV
+          echo "EDGEMESH_VERSION=v1.17.0"           >> $GITHUB_ENV
+          echo "HELM_VERSION=v3.19.2"               >> $GITHUB_ENV
+
+      - name: 构建 EdgeCore 离线包
+        run: |
+          set -euo pipefail
+          echo "=== 构建 EdgeCore 离线包 (架构: ${{ matrix.arch }}) ==="
+          echo "版本信息: KubeEdge ${KUBEEDGE_VERSION}, containerd ${CONTAINERD_VERSION}, runc ${RUNC_VERSION}"
+
+          # 1. 下载 KubeEdge 边缘端包（edgecore 二进制）
+          echo "[1/6] 下载 KubeEdge 边缘端包..."
+          KUBEEDGE_URL="https://github.com/kubeedge/kubeedge/releases/download/v${KUBEEDGE_VERSION}/kubeedge-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          wget -q -O kubeedge.tar.gz "$KUBEEDGE_URL" || (echo "❌ KubeEdge 边缘端包下载失败" && exit 1)
+          tar -xzf kubeedge.tar.gz
+          cp "kubeedge-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}/edge/edgecore" ./edgecore
+          chmod +x ./edgecore
+          rm -rf "kubeedge-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}" kubeedge.tar.gz
+          echo "✓ edgecore 下载完成"
+
+          # 2. 下载 keadm
+          echo "[2/6] 下载 keadm..."
+          KEADM_URL="https://github.com/kubeedge/kubeedge/releases/download/v${KUBEEDGE_VERSION}/keadm-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          wget -q -O keadm.tar.gz "$KEADM_URL" || (echo "❌ keadm 下载失败" && exit 1)
+          tar -xzf keadm.tar.gz
+          cp "keadm-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}/keadm/keadm" ./keadm
+          chmod +x ./keadm
+          rm -rf "keadm-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}" keadm.tar.gz
+          echo "✓ keadm 下载完成"
+
+          # 3. 下载 containerd-static 和 runc
+          # 使用 containerd-static（静态编译），兼容麒麟V10（GLIBC 2.28）、CentOS8、Ubuntu18.04
+          echo "[3/6] 下载 containerd-static 和 runc..."
+          CONTAINERD_STATIC_URL="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-static-${CONTAINERD_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          if ! wget -q -O containerd.tar.gz "$CONTAINERD_STATIC_URL"; then
+            echo "⚠️  v${CONTAINERD_VERSION} containerd-static 不可用，尝试 v1.7.24..."
+            wget -q -O containerd.tar.gz \
+              "https://github.com/containerd/containerd/releases/download/v1.7.24/containerd-static-1.7.24-linux-${{ matrix.arch }}.tar.gz" \
+              || (echo "❌ containerd-static 下载失败" && exit 1)
+          fi
+          tar -xzf containerd.tar.gz || (echo "❌ containerd 解压失败" && exit 1)
+          rm containerd.tar.gz
+          echo "✓ containerd-static 下载完成（兼容 GLIBC 2.28+）"
+
+          RUNC_URL="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.${{ matrix.arch }}"
+          wget -q -O runc "$RUNC_URL" || (echo "❌ runc 下载失败" && exit 1)
+          chmod +x runc
+          echo "✓ runc 下载完成"
+
+          # 4. 下载 CNI 插件
+          echo "[4/6] 下载 CNI 插件..."
+          CNI_URL="https://github.com/containernetworking/plugins/releases/download/v${CNI_VERSION}/cni-plugins-linux-${{ matrix.arch }}-v${CNI_VERSION}.tgz"
+          mkdir -p cni-bin
+          wget -q -O cni-plugins.tgz "$CNI_URL" || (echo "❌ CNI 插件下载失败" && exit 1)
+          tar -xzf cni-plugins.tgz -C cni-bin || (echo "❌ CNI 插件解压失败" && exit 1)
+          rm cni-plugins.tgz
+          echo "✓ CNI 插件下载完成 (${CNI_VERSION})"
+
+          # 5. 拉取并保存离线镜像
+          echo "[5/6] 拉取并保存离线镜像..."
+          mkdir -p images
+
+          # KubeEdge installation-package（keadm join 离线必需）
+          INSTALLATION_PKG="docker.io/kubeedge/installation-package:v${KUBEEDGE_VERSION}"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$INSTALLATION_PKG" \
+            || (echo "❌ installation-package 镜像拉取失败" && exit 1)
+          docker save "$INSTALLATION_PKG" -o "images/kubeedge-installation-package-v${KUBEEDGE_VERSION}.tar"
+          echo "✓ installation-package 镜像已保存"
+
+          # pause 镜像（containerd sandbox 必需）
+          PAUSE_IMAGE="docker.io/kubeedge/pause:3.6"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$PAUSE_IMAGE" \
+            || (echo "❌ pause 镜像拉取失败" && exit 1)
+          docker save "$PAUSE_IMAGE" -o "images/kubeedge-pause-3.6.tar"
+          echo "✓ pause 镜像已保存"
+
+          # EdgeMesh Agent 镜像
+          EDGEMESH_IMAGE="docker.io/kubeedge/edgemesh-agent:${EDGEMESH_VERSION}"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$EDGEMESH_IMAGE" \
+            || (echo "❌ edgemesh-agent 镜像拉取失败" && exit 1)
+          docker save "$EDGEMESH_IMAGE" -o "images/edgemesh-agent-${EDGEMESH_VERSION}.tar"
+          echo "✓ EdgeMesh Agent 镜像已保存"
+
+          # Mosquitto MQTT 镜像（与 CloudCore Helm Chart 版本一致）
+          MQTT_IMAGE="eclipse-mosquitto:1.6.15"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$MQTT_IMAGE" \
+            || (echo "❌ Mosquitto 镜像拉取失败" && exit 1)
+          docker save "$MQTT_IMAGE" -o "images/eclipse-mosquitto-1.6.15.tar"
+          echo "✓ Mosquitto 镜像已保存"
+
+          # 5.5. 下载 Helm 和 EdgeMesh Chart
+          echo "[5.5/6] 下载 Helm 和 EdgeMesh Chart..."
+          HELM_TAR="helm-${HELM_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          wget -q -O helm.tar.gz "https://get.helm.sh/${HELM_TAR}" \
+            || (echo "❌ Helm 下载失败" && exit 1)
+          tar -xzf helm.tar.gz
+          mv "linux-${{ matrix.arch }}/helm" ./helm
+          chmod +x ./helm
+          rm -rf "linux-${{ matrix.arch }}" helm.tar.gz
+          echo "✓ Helm 下载完成 (${HELM_VERSION})"
+
+          mkdir -p helm-charts
+          wget -q -O helm-charts/edgemesh.tgz \
+            "https://raw.githubusercontent.com/kubeedge/edgemesh/main/build/helm/edgemesh.tgz" \
+            || echo "⚠️  EdgeMesh chart 下载失败，跳过"
+
+          # 5.8. 下载 nfs-common 离线 deb
+          echo "[5.8/6] 下载 nfs-common 离线 deb（${{ matrix.arch }}）..."
+          mkdir -p nfs
+          docker run --rm \
+            --platform ${{ matrix.dockerfile_platform }} \
+            -v "$(pwd)/nfs:/debs" \
+            ubuntu:22.04 bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --download-only --no-install-recommends nfs-common 2>/dev/null || true
+              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
+            "
+          echo "✓ nfs-common 离线包: $(ls nfs/*.deb 2>/dev/null | wc -l) 个 deb"
+
+          # 6. 打包
+          echo "[6/6] 创建离线安装包..."
+          INSTALL_DIR="${GITHUB_WORKSPACE}/edgecore/install"
+          if [ ! -f "$INSTALL_DIR/install.sh" ]; then
+            echo "❌ 找不到安装脚本: $INSTALL_DIR/install.sh"
+            exit 1
+          fi
+
+          mkdir -p meta
+          cat > meta/version.txt << EOFMETA
+          kubeedge_version=${KUBEEDGE_VERSION}
+          containerd_version=${CONTAINERD_VERSION}
+          runc_version=${RUNC_VERSION}
+          cni_version=${CNI_VERSION}
+          edgemesh_version=${EDGEMESH_VERSION}
+          arch=${{ matrix.arch }}
+          role=edgecore
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          tag=${TAG_VERSION}
+          EOFMETA
+
+          PACKAGE_NAME="edgecore-v${KUBEEDGE_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
+          TEMP_PKG_DIR="$(mktemp -d)"
+          trap "rm -rf $TEMP_PKG_DIR" EXIT
+
+          cp edgecore keadm runc helm "$TEMP_PKG_DIR/"
+          cp -r bin cni-bin images meta "$TEMP_PKG_DIR/"
+
+          [ -d nfs ] && ls nfs/*.deb &>/dev/null && \
+            cp -r nfs "$TEMP_PKG_DIR/" && echo "✓ 已包含 nfs-common"
+          [ -d helm-charts ] && ls helm-charts/*.tgz &>/dev/null && \
+            cp -r helm-charts "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm Charts"
+
+          mkdir -p "$TEMP_PKG_DIR/install"
+          cp "$INSTALL_DIR/install.sh"  "$TEMP_PKG_DIR/install/"
+          cp "$INSTALL_DIR/cleanup.sh"  "$TEMP_PKG_DIR/install/" 2>/dev/null || true
+          cp "$INSTALL_DIR/README.md"   "$TEMP_PKG_DIR/install/" 2>/dev/null || true
+
+          cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
+          EdgeCore 边缘端离线安装包
+          ==========================
+
+          版本:
+            KubeEdge:   v${KUBEEDGE_VERSION}
+            containerd: ${CONTAINERD_VERSION}（静态编译，兼容麒麟V10）
+            runc:       ${RUNC_VERSION}
+            架构:       ${{ matrix.arch }}
+            构建:       $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          前提条件:
+            CloudCore HA 已安装并运行（cloudcore-ha 离线包）
+            已获取 Edge Token（来自 cloudcore/install/install.sh 输出）
+
+          用法:
+            sudo ./install/install.sh <CLOUDCORE_VIP> <EDGE_TOKEN> [EDGE_NODE_NAME]
+
+          清理:
+            sudo ./install/cleanup.sh
+
+          详细文档: ./install/README.md
+          EOFREADME
+
+          # 完整性校验
+          IMAGE_COUNT=$(find "$TEMP_PKG_DIR/images" -type f -name "*.tar" | wc -l)
+          if [ "$IMAGE_COUNT" -lt 2 ]; then
+            echo "❌ images 目录文件数量不足（期望≥2，实际=${IMAGE_COUNT}）"
+            exit 1
+          fi
+          echo "✓ 镜像文件: ${IMAGE_COUNT} 个"
+
+          tar -czf "$PACKAGE_NAME" -C "$TEMP_PKG_DIR" .
+          echo "✓ 包已创建: $PACKAGE_NAME ($(du -h "$PACKAGE_NAME" | cut -f1))"
+
+      - name: 生成校验和并准备发布
+        run: |
+          PACKAGE_NAME="edgecore-v${KUBEEDGE_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
+          sha256sum "$PACKAGE_NAME" > "${PACKAGE_NAME}.sha256sum.txt"
+          mkdir -p "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}"
+          cp "$PACKAGE_NAME" "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+          cp "${PACKAGE_NAME}.sha256sum.txt" "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+          echo "=== 待发布文件 (${{ matrix.arch }}) ==="
+          ls -lh "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+
+      - name: 上传到 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set_env.outputs.tag_version }}
+          files: release-${{ matrix.arch }}/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,257 @@
+name: 构建和发布 K3s 集群离线包
+
+on:
+  push:
+    tags:
+      - 'v*'
+    paths:
+      - 'k3s-cluster/**'
+      - '.github/workflows/build-release-k3s-cluster.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-k3s-cluster:
+    runs-on: ubuntu-latest
+    name: 构建并发布 K3s 集群离线包 (${{ matrix.arch }})
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            dockerfile_platform: linux/amd64
+          - arch: arm64
+            dockerfile_platform: linux/arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 QEMU 支持
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.dockerfile_platform }}
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 设置环境变量
+        id: set_env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_VERSION="manual-k3s-cluster-${GITHUB_SHA::7}"
+          else
+            TAG_VERSION=${GITHUB_REF#refs/tags/}
+            if [ -z "$TAG_VERSION" ]; then
+              echo "error: 未能解析到 tag" >&2
+              exit 1
+            fi
+          fi
+          echo "TAG_VERSION=${TAG_VERSION}"   >> $GITHUB_ENV
+          echo "tag_version=${TAG_VERSION}"   >> $GITHUB_OUTPUT
+          echo "K3S_VERSION=v1.34.2+k3s1"    >> $GITHUB_ENV
+          echo "HELM_VERSION=v3.19.2"         >> $GITHUB_ENV
+          echo "EDGEMESH_VERSION=v1.17.0"     >> $GITHUB_ENV
+
+      - name: 构建 K3s 集群离线包
+        run: |
+          set -euo pipefail
+          echo "=== 构建 K3s 集群离线包 (架构: ${{ matrix.arch }}) ==="
+          echo "版本: K3s ${K3S_VERSION}"
+
+          # 1. 下载 K3s 二进制文件
+          echo "[1/5] 下载 K3s 二进制文件..."
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            K3S_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s"
+          else
+            K3S_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s-arm64"
+          fi
+          wget -q -O "k3s-${{ matrix.arch }}" "$K3S_URL" \
+            || (echo "❌ 无法下载 k3s" && exit 1)
+          chmod +x "k3s-${{ matrix.arch }}"
+          echo "✓ k3s 下载完成"
+
+          # 2. 下载 K3s 官方 airgap 镜像包（含所有内置镜像）
+          # K3s airgap 包是官方推荐的离线部署方式，放入 /var/lib/rancher/k3s/agent/images/ 后自动加载
+          echo "[2/5] 下载 K3s airgap 镜像包..."
+          mkdir -p images
+          AIRGAP_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s-airgap-images-${{ matrix.arch }}.tar.zst"
+          wget -q -O "images/k3s-airgap-images-${{ matrix.arch }}.tar.zst" "$AIRGAP_URL" \
+            || (echo "❌ K3s airgap 镜像包下载失败" && exit 1)
+          echo "✓ K3s airgap 镜像包下载完成 ($(du -h images/k3s-airgap-images-${{ matrix.arch }}.tar.zst | cut -f1))"
+
+          # 3. 下载 Helm 二进制
+          echo "[3/5] 下载 Helm 二进制..."
+          wget -q -O helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-${{ matrix.arch }}.tar.gz" \
+            || (echo "❌ 无法下载 Helm" && exit 1)
+          tar -xzf helm.tar.gz
+          mv linux-${{ matrix.arch }}/helm ./helm
+          chmod +x ./helm
+          rm -rf linux-${{ matrix.arch }} helm.tar.gz
+          echo "✓ Helm 下载完成 (${HELM_VERSION})"
+
+          # 4. 下载 EdgeMesh Helm Chart（Worker/controller 节点可能需要）
+          echo "[4/5] 下载 EdgeMesh Helm Chart..."
+          mkdir -p helm-charts
+          wget -q -O helm-charts/edgemesh.tgz \
+            "https://raw.githubusercontent.com/kubeedge/edgemesh/main/build/helm/edgemesh.tgz" \
+            || echo "⚠️  EdgeMesh chart 下载失败，跳过"
+
+          # 4.1 下载 nfs-common 离线 deb（在干净容器内获取）
+          echo "[4.1/5] 下载 nfs-common 离线 deb（${{ matrix.arch }}）..."
+          mkdir -p nfs
+          docker run --rm \
+            --platform ${{ matrix.dockerfile_platform }} \
+            -v "$(pwd)/nfs:/debs" \
+            ubuntu:22.04 bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --download-only --no-install-recommends nfs-common 2>/dev/null || true
+              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
+            "
+          echo "✓ nfs-common 离线包: $(ls nfs/*.deb 2>/dev/null | wc -l) 个 deb"
+
+          # 4.2 下载 keepalived 离线 deb（Ubuntu / 麒麟V10 桌面版）
+          echo "[4.2/5] 下载 keepalived 离线 deb（${{ matrix.arch }}）..."
+          mkdir -p keepalived
+          docker run --rm \
+            --platform ${{ matrix.dockerfile_platform }} \
+            -v "$(pwd)/keepalived:/debs" \
+            ubuntu:22.04 bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --download-only --no-install-recommends keepalived 2>/dev/null || true
+              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
+            "
+          DEB_COUNT=$(ls keepalived/*.deb 2>/dev/null | wc -l)
+          echo "✓ keepalived deb 包: ${DEB_COUNT} 个"
+          [ "$DEB_COUNT" -eq 0 ] && echo "❌ keepalived deb 下载失败" && exit 1
+
+          # 4.3 下载 keepalived 离线 rpm（麒麟V10 服务器版 / CentOS / OpenEuler）
+          # 使用 AlmaLinux 8（CentOS 8 继承者，与麒麟V10 Server 高度兼容）
+          echo "[4.3/5] 下载 keepalived 离线 rpm（${{ matrix.arch }}）..."
+          docker run --rm \
+            --platform ${{ matrix.dockerfile_platform }} \
+            -v "$(pwd)/keepalived:/rpms" \
+            almalinux:8 bash -c "
+              yum install -y --downloadonly --downloaddir=/rpms keepalived 2>/dev/null || \
+              dnf install -y --downloadonly --downloaddir=/rpms keepalived 2>/dev/null || true
+            "
+          RPM_COUNT=$(ls keepalived/*.rpm 2>/dev/null | wc -l)
+          echo "✓ keepalived rpm 包: ${RPM_COUNT} 个"
+          [ "$RPM_COUNT" -eq 0 ] && echo "⚠️  keepalived rpm 下载失败（不影响 deb 体系安装）" || true
+
+          # 5. 打包
+          echo "[5/5] 创建离线安装包..."
+          INSTALL_DIR="${GITHUB_WORKSPACE}/k3s-cluster/install"
+          KA_TPL_DIR="${GITHUB_WORKSPACE}/k3s-cluster/keepalived"
+
+          if [ ! -f "$INSTALL_DIR/install.sh" ]; then
+            echo "❌ 找不到安装脚本: $INSTALL_DIR/install.sh"
+            exit 1
+          fi
+
+          # 写入元数据
+          mkdir -p meta
+          cat > meta/version.txt << EOFMETA
+          k3s_version=${K3S_VERSION}
+          helm_version=${HELM_VERSION}
+          arch=${{ matrix.arch }}
+          role=k3s-cluster
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          tag=${TAG_VERSION}
+          EOFMETA
+
+          PACKAGE_NAME="k3s-cluster-${K3S_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
+          TEMP_PKG_DIR="$(mktemp -d)"
+          trap "rm -rf $TEMP_PKG_DIR" EXIT
+
+          # 复制文件
+          cp "k3s-${{ matrix.arch }}" "$TEMP_PKG_DIR/"
+          cp -r images "$TEMP_PKG_DIR/"
+          cp -r meta "$TEMP_PKG_DIR/"
+          cp helm "$TEMP_PKG_DIR/"
+          [ -d nfs ] && ls nfs/*.deb &>/dev/null && cp -r nfs "$TEMP_PKG_DIR/" && echo "✓ 已包含 nfs-common"
+          if [ -d keepalived ] && { ls keepalived/*.deb &>/dev/null || ls keepalived/*.rpm &>/dev/null; }; then
+            cp -r keepalived "$TEMP_PKG_DIR/"
+            DEB_N=$(ls keepalived/*.deb 2>/dev/null | wc -l)
+            RPM_N=$(ls keepalived/*.rpm 2>/dev/null | wc -l)
+            echo "✓ 已包含 keepalived 离线包（deb: ${DEB_N} 个，rpm: ${RPM_N} 个）"
+          else
+            echo "❌ keepalived 离线包目录为空，离线包不完整" && exit 1
+          fi
+          [ -d helm-charts ] && ls helm-charts/*.tgz &>/dev/null && cp -r helm-charts "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm Charts"
+
+          # 复制安装脚本和 keepalived 模板
+          mkdir -p "$TEMP_PKG_DIR/install" "$TEMP_PKG_DIR/keepalived"
+          cp "$INSTALL_DIR/install.sh"  "$TEMP_PKG_DIR/install/"
+          cp "$INSTALL_DIR/cleanup.sh"  "$TEMP_PKG_DIR/install/" 2>/dev/null || true
+          cp "$INSTALL_DIR/README.md"   "$TEMP_PKG_DIR/install/" 2>/dev/null || true
+          [ -d "$KA_TPL_DIR" ] && cp -r "$KA_TPL_DIR"/. "$TEMP_PKG_DIR/keepalived/" && echo "✓ 已包含 keepalived 模板"
+
+          # 生成包内说明
+          cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
+          K3s 集群离线安装包（三合一 + keepalived VIP）
+          ============================================
+          版本:
+            K3s:   ${K3S_VERSION}
+            架构:  ${{ matrix.arch }}
+            构建:  $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          支持操作系统（纯内网离线安装）:
+            - Ubuntu 20.04 / 22.04
+            - 银河麒麟 V10 桌面版（deb 体系）
+            - 银河麒麟 V10 服务器版（rpm 体系，AlmaLinux 8 兼容）
+            - CentOS 7/8 / Rocky Linux / OpenEuler
+          用法:
+            # 首控制节点（建集群）
+            sudo ./install/install.sh --init <NODE_IP> [NODE_NAME]
+            # 首控制节点 + 同时配置 keepalived MASTER VIP
+            sudo ./install/install.sh --init <NODE_IP> [NODE_NAME] --vip <VIP_IP>[/<PREFIX>]
+            例: sudo ./install/install.sh --init 192.168.1.10 k3s-master-01 --vip 192.168.1.200/24
+            # 扩容控制节点（HA 第2/3台）+ 同时配置 keepalived BACKUP
+            sudo ./install/install.sh --server <FIRST_IP:PORT> <TOKEN> <THIS_IP> [NODE_NAME] --vip <VIP_IP>[/<PREFIX>]
+            例: sudo ./install/install.sh --server 192.168.1.10:6443 K10xxx 192.168.1.11 k3s-master-02 --vip 192.168.1.200/24
+            # Worker 节点（无需 keepalived）
+            sudo ./install/install.sh --agent <SERVER_IP:PORT> <TOKEN> [NODE_NAME]
+            # 跳过 keepalived 安装
+            sudo ./install/install.sh --init <NODE_IP> --skip-keepalived
+          keepalived 离线包（已内置，自动识别包管理器）:
+            ./keepalived/*.deb  -> Ubuntu / 麒麟V10 桌面版
+            ./keepalived/*.rpm  -> 麒麟V10 服务器版 / CentOS / OpenEuler
+          清理: sudo ./install/cleanup.sh
+          详细文档: ./install/README.md
+          EOFREADME
+
+          tar -czf "$PACKAGE_NAME" -C "$TEMP_PKG_DIR" .
+          echo "✓ 包已创建: $PACKAGE_NAME ($(du -h "$PACKAGE_NAME" | cut -f1))"
+
+          # 校验镜像完整性
+          IMAGE_COUNT=$(find "$TEMP_PKG_DIR/images" -type f \( -name "*.tar" -o -name "*.tar.zst" \) | wc -l)
+          if [ "$IMAGE_COUNT" -lt 1 ]; then
+            echo "❌ images 目录为空，离线包不完整"
+            exit 1
+          fi
+          echo "✓ 镜像文件: ${IMAGE_COUNT} 个"
+
+      - name: 生成校验和并准备发布
+        run: |
+          PACKAGE_NAME="k3s-cluster-${K3S_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
+          sha256sum "$PACKAGE_NAME" > "${PACKAGE_NAME}.sha256sum.txt"
+          mkdir -p "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}"
+          cp "$PACKAGE_NAME" "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+          cp "${PACKAGE_NAME}.sha256sum.txt" "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+          echo "=== 待发布文件 (${{ matrix.arch }}) ==="
+          ls -lh "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+
+      - name: 上传到 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set_env.outputs.tag_version }}
+          files: release-${{ matrix.arch }}/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
