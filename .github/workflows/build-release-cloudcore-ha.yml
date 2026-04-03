@@ -1,0 +1,288 @@
+name: 构建和发布 CloudCore HA 离线包
+
+on:
+  push:
+    tags:
+      - 'v*'
+    paths:
+      - 'cloudcore/**'
+      - '.github/workflows/build-release-cloudcore-ha.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-cloudcore-ha:
+    runs-on: ubuntu-latest
+    name: 构建并发布 CloudCore HA 离线包 (${{ matrix.arch }})
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            dockerfile_platform: linux/amd64
+          - arch: arm64
+            dockerfile_platform: linux/arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 QEMU 支持
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.dockerfile_platform }}
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 设置环境变量
+        id: set_env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_VERSION="manual-cloudcore-${GITHUB_SHA::7}"
+          else
+            TAG_VERSION=${GITHUB_REF#refs/tags/}
+            if [ -z "$TAG_VERSION" ]; then
+              echo "error: 未能解析到 tag" >&2
+              exit 1
+            fi
+          fi
+          echo "TAG_VERSION=${TAG_VERSION}"         >> $GITHUB_ENV
+          echo "tag_version=${TAG_VERSION}"         >> $GITHUB_OUTPUT
+          echo "KUBEEDGE_VERSION=1.22.0"            >> $GITHUB_ENV
+          echo "EDGEMESH_VERSION=v1.17.0"           >> $GITHUB_ENV
+          echo "METRICS_SERVER_VERSION=v0.8.0"      >> $GITHUB_ENV
+          echo "HELM_VERSION=v3.19.2"               >> $GITHUB_ENV
+          echo "ISTIO_VERSION=1.22.1"               >> $GITHUB_ENV
+
+      - name: 构建 CloudCore HA 离线包
+        run: |
+          set -euo pipefail
+          echo "=== 构建 CloudCore HA 离线包 (架构: ${{ matrix.arch }}) ==="
+          echo "版本信息: KubeEdge ${KUBEEDGE_VERSION}, EdgeMesh ${EDGEMESH_VERSION}"
+
+          # 1. 下载 keadm（CloudCore 安装工具）
+          echo "[1/7] 下载 KubeEdge keadm..."
+          KEADM_URL="https://github.com/kubeedge/kubeedge/releases/download/v${KUBEEDGE_VERSION}/keadm-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          wget -q -O keadm.tar.gz "$KEADM_URL" || (echo "❌ keadm 下载失败" && exit 1)
+          tar -xzf keadm.tar.gz
+          cp "keadm-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}/keadm/keadm" ./keadm
+          chmod +x ./keadm
+          rm -rf "keadm-v${KUBEEDGE_VERSION}-linux-${{ matrix.arch }}" keadm.tar.gz
+          echo "✓ keadm 下载完成"
+
+          # 2. 拉取并保存 CloudCore 及相关镜像
+          echo "[2/7] 拉取并保存 KubeEdge CloudCore 镜像..."
+          mkdir -p images
+
+          # CloudCore 主镜像
+          CLOUDCORE_IMAGE="docker.io/kubeedge/cloudcore:v${KUBEEDGE_VERSION}"
+          echo "  拉取 CloudCore: $CLOUDCORE_IMAGE"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$CLOUDCORE_IMAGE" \
+            || (echo "❌ CloudCore 镜像拉取失败" && exit 1)
+          docker save "$CLOUDCORE_IMAGE" -o "images/cloudcore-v${KUBEEDGE_VERSION}.tar"
+          echo "✓ CloudCore 镜像: $(du -h images/cloudcore-v${KUBEEDGE_VERSION}.tar | cut -f1)"
+
+          # Iptables Manager 镜像
+          IPTABLES_IMAGE="docker.io/kubeedge/iptables-manager:v${KUBEEDGE_VERSION}"
+          echo "  拉取 iptables-manager: $IPTABLES_IMAGE"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$IPTABLES_IMAGE" || true
+          docker save "$IPTABLES_IMAGE" -o "images/iptables-manager-v${KUBEEDGE_VERSION}.tar" 2>/dev/null \
+            && echo "✓ iptables-manager 镜像已保存" || echo "⚠️  iptables-manager 镜像不可用，跳过"
+
+          # KubeEdge Controller Manager 镜像（注意：镜像名含连字符 controller-manager）
+          CONTROLLER_MGR_IMAGE="docker.io/kubeedge/controller-manager:v${KUBEEDGE_VERSION}"
+          echo "  拉取 controller-manager: $CONTROLLER_MGR_IMAGE"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$CONTROLLER_MGR_IMAGE" || true
+          docker save "$CONTROLLER_MGR_IMAGE" -o "images/controller-manager-v${KUBEEDGE_VERSION}.tar" 2>/dev/null \
+            && echo "✓ controller-manager 镜像已保存" || echo "⚠️  controller-manager 镜像不可用，跳过"
+
+          # Admission Controller 镜像
+          ADMISSION_IMAGE="docker.io/kubeedge/admission:v${KUBEEDGE_VERSION}"
+          echo "  拉取 admission: $ADMISSION_IMAGE"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$ADMISSION_IMAGE" || true
+          docker save "$ADMISSION_IMAGE" -o "images/admission-v${KUBEEDGE_VERSION}.tar" 2>/dev/null \
+            && echo "✓ admission 镜像已保存" || echo "⚠️  admission 镜像不可用，跳过"
+
+          # Metrics Server 镜像
+          echo "[3/7] 拉取 Metrics Server 镜像..."
+          METRICS_IMAGE="registry.k8s.io/metrics-server/metrics-server:${METRICS_SERVER_VERSION}"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$METRICS_IMAGE" \
+            || (echo "❌ Metrics Server 镜像拉取失败" && exit 1)
+          docker save "$METRICS_IMAGE" -o "images/metrics-server-${METRICS_SERVER_VERSION}.tar"
+          echo "✓ Metrics Server 镜像: $(du -h images/metrics-server-${METRICS_SERVER_VERSION}.tar | cut -f1)"
+
+          # EdgeMesh Server/Agent 镜像（云端 DaemonSet 需要）
+          echo "[4/7] 拉取 EdgeMesh 镜像..."
+          EDGEMESH_SERVER_IMAGE="docker.io/kubeedge/edgemesh-server:${EDGEMESH_VERSION}"
+          EDGEMESH_AGENT_IMAGE="docker.io/kubeedge/edgemesh-agent:${EDGEMESH_VERSION}"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$EDGEMESH_SERVER_IMAGE" \
+            || (echo "❌ edgemesh-server 镜像拉取失败" && exit 1)
+          docker save "$EDGEMESH_SERVER_IMAGE" -o "images/edgemesh-server-${EDGEMESH_VERSION}.tar"
+          docker pull --platform ${{ matrix.dockerfile_platform }} "$EDGEMESH_AGENT_IMAGE" \
+            || (echo "❌ edgemesh-agent 镜像拉取失败" && exit 1)
+          docker save "$EDGEMESH_AGENT_IMAGE" -o "images/edgemesh-agent-${EDGEMESH_VERSION}.tar"
+          echo "✓ EdgeMesh 镜像: server + agent"
+
+          # 5. 下载 Helm 二进制及 Chart
+          echo "[5/7] 下载 Helm 二进制..."
+          HELM_TAR="helm-${HELM_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          wget -q -O helm.tar.gz "https://get.helm.sh/${HELM_TAR}" \
+            || (echo "❌ Helm 下载失败" && exit 1)
+          tar -xzf helm.tar.gz
+          mv linux-${{ matrix.arch }}/helm ./helm
+          chmod +x ./helm
+          rm -rf linux-${{ matrix.arch }} helm.tar.gz
+          echo "✓ Helm 下载完成 (${HELM_VERSION})"
+
+          mkdir -p helm-charts
+          wget -q -O helm-charts/edgemesh.tgz \
+            "https://raw.githubusercontent.com/kubeedge/edgemesh/main/build/helm/edgemesh.tgz" \
+            || echo "⚠️  EdgeMesh chart 下载失败，跳过"
+
+          # 6. 下载 Istio CRDs（EdgeMesh 需要）
+          echo "[6/7] 下载 Istio CRDs..."
+          mkdir -p istio-crds
+          ISTIO_CRD_URL="https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istio-${ISTIO_VERSION}-linux-amd64.tar.gz"
+          if wget -q -O istio.tar.gz "$ISTIO_CRD_URL"; then
+            tar -xzf istio.tar.gz "istio-${ISTIO_VERSION}/manifests/charts/base/crds/" \
+              --strip-components=4 -C istio-crds/ 2>/dev/null || true
+            rm -f istio.tar.gz
+            echo "✓ Istio CRDs 下载完成 ($(ls istio-crds/*.yaml 2>/dev/null | wc -l) 个文件)"
+          else
+            echo "⚠️  Istio tarball 下载失败，尝试直接下载 CRD yaml..."
+            for crd in crd-all.gen.yaml crd-mixer.gen.yaml crd-operator.gen.yaml; do
+              wget -q -O "istio-crds/${crd}" \
+                "https://raw.githubusercontent.com/istio/istio/${ISTIO_VERSION}/manifests/charts/base/crds/${crd}" \
+                || echo "  ⚠️  $crd 下载失败，跳过"
+            done
+          fi
+
+          # 6.5. 下载 keepalived 离线 deb（CloudCore VIP 所需）
+          echo "[6.5/7] 下载 keepalived 离线 deb（${{ matrix.arch }}）..."
+          mkdir -p keepalived-deb
+          docker run --rm \
+            --platform ${{ matrix.dockerfile_platform }} \
+            -v "$(pwd)/keepalived-deb:/debs" \
+            ubuntu:22.04 bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --download-only --no-install-recommends keepalived 2>/dev/null || true
+              find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} /debs/ \;
+            "
+          echo "✓ keepalived 离线包: $(ls keepalived-deb/*.deb 2>/dev/null | wc -l) 个 deb"
+
+          # 7. 打包
+          echo "[7/7] 创建离线安装包..."
+          INSTALL_DIR="${GITHUB_WORKSPACE}/cloudcore/install"
+          MANIFESTS_DIR="${GITHUB_WORKSPACE}/cloudcore/manifests"
+          SCRIPT_DIR="${GITHUB_WORKSPACE}/cloudcore/script"
+          KA_TPL_DIR="${GITHUB_WORKSPACE}/cloudcore/keepalived"
+
+          if [ ! -f "$INSTALL_DIR/install.sh" ]; then
+            echo "❌ 找不到安装脚本: $INSTALL_DIR/install.sh"
+            exit 1
+          fi
+
+          mkdir -p meta
+          cat > meta/version.txt << EOFMETA
+          kubeedge_version=${KUBEEDGE_VERSION}
+          edgemesh_version=${EDGEMESH_VERSION}
+          metrics_server_version=${METRICS_SERVER_VERSION}
+          arch=${{ matrix.arch }}
+          role=cloudcore-ha
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          tag=${TAG_VERSION}
+          EOFMETA
+
+          PACKAGE_NAME="cloudcore-ha-v${KUBEEDGE_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
+          TEMP_PKG_DIR="$(mktemp -d)"
+          trap "rm -rf $TEMP_PKG_DIR" EXIT
+
+          # 二进制、镜像、元数据
+          cp keadm helm "$TEMP_PKG_DIR/"
+          cp -r images meta "$TEMP_PKG_DIR/"
+          [ -d istio-crds ] && ls istio-crds/*.yaml &>/dev/null && \
+            cp -r istio-crds "$TEMP_PKG_DIR/" && echo "✓ 已包含 Istio CRDs"
+          [ -d helm-charts ] && ls helm-charts/*.tgz &>/dev/null && \
+            cp -r helm-charts "$TEMP_PKG_DIR/" && echo "✓ 已包含 Helm Charts"
+          [ -d keepalived-deb ] && ls keepalived-deb/*.deb &>/dev/null && \
+            cp -r keepalived-deb "$TEMP_PKG_DIR/" && echo "✓ 已包含 keepalived deb"
+
+          # 安装脚本、manifests、辅助脚本
+          mkdir -p "$TEMP_PKG_DIR/install" "$TEMP_PKG_DIR/manifests" \
+                   "$TEMP_PKG_DIR/script"  "$TEMP_PKG_DIR/keepalived"
+          cp "$INSTALL_DIR/install.sh"  "$TEMP_PKG_DIR/install/"
+          cp "$INSTALL_DIR/cleanup.sh"  "$TEMP_PKG_DIR/install/" 2>/dev/null || true
+          cp "$INSTALL_DIR/README.md"   "$TEMP_PKG_DIR/install/" 2>/dev/null || true
+          [ -d "$MANIFESTS_DIR" ]  && cp -r "$MANIFESTS_DIR"/. "$TEMP_PKG_DIR/manifests/" && echo "✓ 已包含 K8s manifests"
+          [ -d "$SCRIPT_DIR" ]     && cp -r "$SCRIPT_DIR"/.   "$TEMP_PKG_DIR/script/"    && echo "✓ 已包含辅助脚本"
+          [ -d "$KA_TPL_DIR" ]     && cp -r "$KA_TPL_DIR"/.   "$TEMP_PKG_DIR/keepalived/" && echo "✓ 已包含 keepalived 模板"
+
+          # 包内说明
+          cat > "$TEMP_PKG_DIR/README.txt" << EOFREADME
+          CloudCore HA 离线安装包
+          =======================
+
+          版本:
+            KubeEdge:       v${KUBEEDGE_VERSION}
+            EdgeMesh:       ${EDGEMESH_VERSION}
+            Metrics Server: ${METRICS_SERVER_VERSION}
+            架构:           ${{ matrix.arch }}
+            构建:           $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          前提条件:
+            已完成 K3s 集群安装（k3s-cluster 离线包）
+
+          用法:
+            sudo ./install/install.sh --vip <CLOUDCORE_VIP> --nodes "<NODE_IP_1>[,NODE_IP_2,NODE_IP_3]" [--replicas N]
+
+          示例（单节点 CloudCore）:
+            sudo ./install/install.sh --vip 192.168.1.100 --nodes "192.168.1.10"
+
+          示例（三节点 CloudCore HA）:
+            sudo ./install/install.sh --vip 192.168.1.100 --nodes "192.168.1.10,192.168.1.11,192.168.1.12" --replicas 3
+
+          清理（仅删除 CloudCore，不影响 K3s）:
+            sudo ./install/cleanup.sh
+
+          keepalived VIP 模板（CloudCore HA VIP）:
+            ./keepalived/keepalived-master.conf.tpl
+            ./keepalived/keepalived-backup.conf.tpl
+
+          详细文档: ./install/README.md
+          EOFREADME
+
+          # 完整性校验
+          IMAGE_COUNT=$(find "$TEMP_PKG_DIR/images" -type f -name "*.tar" | wc -l)
+          if [ "$IMAGE_COUNT" -lt 2 ]; then
+            echo "❌ images 目录文件数量不足（期望≥2，实际=${IMAGE_COUNT}）"
+            exit 1
+          fi
+          echo "✓ 镜像文件: ${IMAGE_COUNT} 个"
+
+          tar -czf "$PACKAGE_NAME" -C "$TEMP_PKG_DIR" .
+          echo "✓ 包已创建: $PACKAGE_NAME ($(du -h "$PACKAGE_NAME" | cut -f1))"
+
+      - name: 生成校验和并准备发布
+        run: |
+          PACKAGE_NAME="cloudcore-ha-v${KUBEEDGE_VERSION}-${{ matrix.arch }}-${TAG_VERSION}.tar.gz"
+          sha256sum "$PACKAGE_NAME" > "${PACKAGE_NAME}.sha256sum.txt"
+          mkdir -p "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}"
+          cp "$PACKAGE_NAME" "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+          cp "${PACKAGE_NAME}.sha256sum.txt" "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+          echo "=== 待发布文件 (${{ matrix.arch }}) ==="
+          ls -lh "${GITHUB_WORKSPACE}/release-${{ matrix.arch }}/"
+
+      - name: 上传到 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set_env.outputs.tag_version }}
+          files: release-${{ matrix.arch }}/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
